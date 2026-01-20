@@ -1,0 +1,257 @@
+mcp:
+  server_name: "PRXS MCP Server"
+  version: "0.1.0"
+  transport: "stdio"
+
+# PRXS services to expose as MCP tools
+tools:
+  # Math & Calculations
+  - prxs_service: "MathOracle-v1"
+    mcp_name: "calculate"
+    description: "Perform mathematical calculations (sqrt, square, factorial)"
+    enabled: true
+
+  # Web & Search
+  - prxs_service: "TavilySearch-v1"
+    mcp_name: "web_search"
+    description: "Search the web using Tavily API and return relevant results"
+    enabled: true
+
+  - prxs_service: "WebScraper-v1"
+    mcp_name: "web_scraper"
+    description: "Fetch URL content and extract text/json data"
+    enabled: false
+
+  - prxs_service: "WebhookCaller-v1"
+    mcp_name: "webhook_caller"
+    description: "Call arbitrary HTTP endpoints (GET, POST, etc.)"
+    enabled: false
+
+  # Crypto & DeFi
+  - prxs_service: "DefiAPY-v1"
+    mcp_name: "get_defi_apy"
+    description: "Find best DeFi pools by APY across multiple chains (DefiLlama)"
+    enabled: false
+
+  - prxs_service: "PriceOracle-v1"
+    mcp_name: "get_binance_price"
+    description: "Get cryptocurrency price from Binance exchange"
+    enabled: true
+
+  - prxs_service: "CryptoWallet-v1"
+    mcp_name: "crypto_wallet"
+    description: "Read balances and send ETH transactions via RPC"
+    enabled: false
+
+  - prxs_service: "GasTracker-v1"
+    mcp_name: "gas_tracker"
+    description: "Get current gas prices from Ethereum, BSC, Polygon, Arbitrum"
+    enabled: false
+
+  - prxs_service: "SmartContractAnalyzer-v1"
+    mcp_name: "smart_contract_analyzer"
+    description: "Analyze smart contracts for security issues and functions"
+    enabled: false
+
+  - prxs_service: "TxDecoder-v1"
+    mcp_name: "tx_decoder"
+    description: "Decode and explain blockchain transactions in human-readable format"
+    enabled: false
+
+  # AI & LLM
+  - prxs_service: "LLMInference-v1"
+    mcp_name: "llm_inference"
+    description: "Text generation via OpenAI or HuggingFace Inference API"
+    enabled: false
+
+  - prxs_service: "Orchestrator-v1"
+    mcp_name: "orchestrator"
+    description: "LangGraph orchestrator with planning and built-in tools"
+    enabled: false
+
+  # Document Processing
+  - prxs_service: "PDFSummarizer-v1"
+    mcp_name: "pdf_summarizer"
+    description: "Fetch and summarize PDFs or answer questions about documents"
+    enabled: false
+
+  - prxs_service: "DocWriter-v1"
+    mcp_name: "doc_writer"
+    description: "Append data to Google Sheets or create/update Notion pages"
+    enabled: false
+
+  # Communications
+  - prxs_service: "EmailNotifier-v1"
+    mcp_name: "email_notifier"
+    description: "Send emails via SMTP or fetch recent emails via IMAP"
+    enabled: false
+
+  - prxs_service: "TelegramBridge-v1"
+    mcp_name: "telegram_bridge"
+    description: "Send or fetch Telegram messages via Bot API"
+    enabled: false
+
+  # DevOps & Monitoring
+  - prxs_service: "GitRunner-v1"
+    mcp_name: "git_runner"
+    description: "Clone git repo, checkout branch, and run commands"
+    enabled: false
+
+  - prxs_service: "Monitor-v1"
+    mcp_name: "monitor"
+    description: "Perform ping, HTTP, or TLS expiry checks for monitoring"
+    enabled: false
+
+  - prxs_service: "HomeAssistant-v1"
+    mcp_name: "home_assistant"
+    description: "Read or set entity state via Home Assistant REST API"
+    enabled: false
+
+budget:
+  global:
+    max_calls_per_minute: 30
+    max_calls_per_hour: 500
+    max_calls_per_day: 0  # 0 = unlimited
+    timeout_sec: 0
+    max_total_execution_time_sec: 0
+
+  per_tool:
+    # Math & Calculations
+    calculate:
+      max_calls_per_minute: 10
+      max_calls_per_hour: 100
+      max_calls_per_day: 0
+      timeout_sec: 5
+      max_total_execution_time_sec: 0
+
+    # Web & Search
+    web_search:
+      max_calls_per_minute: 5
+      max_calls_per_hour: 50
+      max_calls_per_day: 100
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    web_scraper:
+      max_calls_per_minute: 10
+      max_calls_per_hour: 100
+      max_calls_per_day: 0
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    webhook_caller:
+      max_calls_per_minute: 10
+      max_calls_per_hour: 100
+      max_calls_per_day: 0
+      timeout_sec: 15
+      max_total_execution_time_sec: 0
+
+    # Crypto & DeFi
+    get_defi_apy:
+      max_calls_per_minute: 5
+      max_calls_per_hour: 50
+      max_calls_per_day: 0
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    get_binance_price:
+      max_calls_per_minute: 10
+      max_calls_per_hour: 100
+      max_calls_per_day: 0
+      timeout_sec: 10
+      max_total_execution_time_sec: 0
+
+    crypto_wallet:
+      max_calls_per_minute: 3
+      max_calls_per_hour: 30
+      max_calls_per_day: 0
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    gas_tracker:
+      max_calls_per_minute: 10
+      max_calls_per_hour: 100
+      max_calls_per_day: 0
+      timeout_sec: 15
+      max_total_execution_time_sec: 0
+
+    smart_contract_analyzer:
+      max_calls_per_minute: 3
+      max_calls_per_hour: 30
+      max_calls_per_day: 0
+      timeout_sec: 60
+      max_total_execution_time_sec: 0
+
+    tx_decoder:
+      max_calls_per_minute: 5
+      max_calls_per_hour: 50
+      max_calls_per_day: 0
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    # AI & LLM
+    llm_inference:
+      max_calls_per_minute: 5
+      max_calls_per_hour: 50
+      max_calls_per_day: 0
+      timeout_sec: 60
+      max_total_execution_time_sec: 0
+
+    orchestrator:
+      max_calls_per_minute: 3
+      max_calls_per_hour: 30
+      max_calls_per_day: 0
+      timeout_sec: 120
+      max_total_execution_time_sec: 0
+
+    # Document Processing
+    pdf_summarizer:
+      max_calls_per_minute: 3
+      max_calls_per_hour: 30
+      max_calls_per_day: 0
+      timeout_sec: 60
+      max_total_execution_time_sec: 0
+
+    doc_writer:
+      max_calls_per_minute: 5
+      max_calls_per_hour: 50
+      max_calls_per_day: 0
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    # Communications
+    email_notifier:
+      max_calls_per_minute: 3
+      max_calls_per_hour: 30
+      max_calls_per_day: 0
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    telegram_bridge:
+      max_calls_per_minute: 5
+      max_calls_per_hour: 50
+      max_calls_per_day: 0
+      timeout_sec: 15
+      max_total_execution_time_sec: 0
+
+    # DevOps & Monitoring
+    git_runner:
+      max_calls_per_minute: 3
+      max_calls_per_hour: 30
+      max_calls_per_day: 0
+      timeout_sec: 60
+      max_total_execution_time_sec: 0
+
+    monitor:
+      max_calls_per_minute: 10
+      max_calls_per_hour: 100
+      max_calls_per_day: 0
+      timeout_sec: 30
+      max_total_execution_time_sec: 0
+
+    home_assistant:
+      max_calls_per_minute: 10
+      max_calls_per_hour: 100
+      max_calls_per_day: 0
+      timeout_sec: 15
+      max_total_execution_time_sec: 0

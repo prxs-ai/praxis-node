@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,16 @@ type RegistrationRecord struct {
 	AddrInfo    peer.AddrInfo
 }
 
+// freezedStake represents a stake that is temporarily frozen during unregistration.
+type freezedStake struct {
+	ID        string
+	PeerID    peer.ID
+	CreatedAt int64 // Unix timestamp
+}
+
+// UNFREEZE_DELAY is the duration (in seconds) a stake must remain frozen before unfreezing.
+const UNFREEZE_DELAY = 7 * 86400 // 7 days
+
 // RegistryNode holds the state of the marketplace
 type RegistryNode struct {
 	Host host.Host
@@ -51,12 +62,17 @@ type RegistryNode struct {
 
 	mu sync.Mutex
 
-	minStake        float64
-	seenStakeNonces map[string]bool // Anti-replay for NEW stakes
-	stakeMu         sync.Mutex
+	minStake          float64
+	seenStakeNonces   map[string]bool            // Replay protection for stake nonces
+	peerStakes        map[peer.ID][]string       // PeerID -> list of stake IDs
+	freezedPeerStakes map[peer.ID][]freezedStake // PeerID -> list of frozen stakes
+	freezedStakes     []freezedStake             // All frozen stakes for periodic cleanup
+	stakeMu           sync.Mutex
 
-	qdrant  *QdrantClient
-	storage *storage.RedisStorage
+	qdrant       *QdrantClient
+	storage      *storage.RedisStorage
+	embeddingDim int
+	embedder     *EmbeddingClient
 }
 
 func main() {
@@ -73,6 +89,10 @@ func main() {
 	qdrantURL := flag.String("qdrant-url", "http://localhost:6333", "Qdrant base URL")
 	qdrantCollection := flag.String("qdrant-collection", "prxs_services", "Qdrant collection name")
 	redisAddr := flag.String("redis", "", "Redis address (e.g., localhost:6379) - if set, registrations are stored in both memory and Redis")
+	embeddingDim := flag.Int("embedding-dim", 1536, "Embedding dimension (e.g., 1536 for text-embedding-3-small)")
+	embeddingModel := flag.String("embedding-model", "text-embedding-3-small", "Embedding model name (used for query embeddings)")
+	embeddingBaseURL := flag.String("embedding-base-url", "https://api.openai.com/v1", "Embedding API base URL")
+	embeddingAPIKey := flag.String("embedding-api-key", "", "Embedding API key (default: OPENAI_API_KEY env)")
 	flag.Parse()
 
 	// Load Key if specified, otherwise generate ephemeral
@@ -89,10 +109,25 @@ func main() {
 		privKey, _, _ = crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, rand.Reader)
 	}
 
-	startRegistry(*port, *apiPort, *bootstrap, *devMode, *minStake, privKey, *qdrantURL, *qdrantCollection, *qdrantEnabled, *redisAddr)
+	// Get LLM configuration from environment (LLM_API_KEY > OPENAI_API_KEY)
+	key := *embeddingAPIKey
+	if key == "" {
+		key = os.Getenv("LLM_API_KEY")
+		if key == "" {
+			key = os.Getenv("OPENAI_API_KEY")
+		}
+	}
+
+	// Auto-detect base URL for OpenRouter if key starts with sk-or-
+	baseURL := *embeddingBaseURL
+	if *embeddingBaseURL == "https://api.openai.com/v1" && strings.HasPrefix(key, "sk-or-") {
+		baseURL = "https://openrouter.ai/api/v1"
+	}
+
+	startRegistry(*port, *apiPort, *bootstrap, *devMode, *minStake, privKey, *qdrantURL, *qdrantCollection, *qdrantEnabled, *redisAddr, *embeddingDim, *embeddingModel, baseURL, key)
 }
 
-func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, minStake float64, privKey crypto.PrivKey, qdrantURL, qdrantCollection string, qdrantEnabled bool, redisAddr string) {
+func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, minStake float64, privKey crypto.PrivKey, qdrantURL, qdrantCollection string, qdrantEnabled bool, redisAddr string, embeddingDim int, embeddingModel, embeddingBaseURL, embeddingAPIKey string) {
 	ctx := context.Background()
 
 	h, err := libp2p.New(common.CommonLibp2pOptions(port, privKey)...)
@@ -100,32 +135,58 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 		log.Fatal(err)
 	}
 
+	if embeddingDim <= 0 {
+		log.Fatalf("embedding-dim must be > 0 (got %d)", embeddingDim)
+	}
+
 	var qdrant *QdrantClient
 	if qdrantEnabled && qdrantURL != "" && qdrantCollection != "" {
 		qdrant = NewQdrantClient(qdrantURL, qdrantCollection)
-		fmt.Printf("[Reg] Qdrant enabled: url=%s collection=%s\n", qdrantURL, qdrantCollection)
+		fmt.Printf("[Reg] Qdrant enabled: url=%s collection=%s dim=%d\n", qdrantURL, qdrantCollection, embeddingDim)
+	}
+
+	var embedder *EmbeddingClient
+	if qdrantEnabled {
+		if embeddingAPIKey == "" {
+			log.Fatalf("embedding API key required for semantic search (set -embedding-api-key or OPENAI_API_KEY)")
+		}
+		embedder = NewEmbeddingClient(embeddingAPIKey, embeddingModel, embeddingBaseURL, embeddingDim)
 	}
 
 	// Initialize Redis storage if address is provided
 	redisStorage, err := storage.NewRedisStorage(redisAddr, 120*time.Second)
 	if err != nil {
-		log.Fatalf("[Reg] Failed to initialize Redis storage: %v", err)
+		log.Printf("[Reg] Warning: Failed to initialize Redis storage: %v", err)
+		log.Printf("[Reg] Continuing without Redis persistence (in-memory only)")
+		redisStorage = nil
 	}
 
 	reg := &RegistryNode{
-		Host:            h,
-		Registrations:   make(map[peer.ID]*RegistrationRecord),
-		ServiceIndex:    make(map[string][]peer.ID),
-		minStake:        minStake,
-		seenStakeNonces: make(map[string]bool),
-		qdrant:          qdrant,
-		storage:         redisStorage,
+		Host:              h,
+		Registrations:     make(map[peer.ID]*RegistrationRecord),
+		ServiceIndex:      make(map[string][]peer.ID),
+		minStake:          minStake,
+		seenStakeNonces:   make(map[string]bool),
+		peerStakes:        make(map[peer.ID][]string),
+		freezedPeerStakes: make(map[peer.ID][]freezedStake),
+		freezedStakes:     make([]freezedStake, 0),
+		qdrant:            qdrant,
+		storage:           redisStorage,
+		embeddingDim:      embeddingDim,
+		embedder:          embedder,
 	}
 
 	// Restore state from Redis if enabled
 	if redisStorage != nil {
 		if err := reg.restoreStateFromRedis(ctx); err != nil {
 			log.Printf("[Reg] Warning: Failed to restore state from Redis: %v", err)
+		}
+
+		// Rebuild Qdrant index from restored registrations
+		if reg.qdrant != nil {
+			if err := reg.reindexQdrant(ctx); err != nil {
+				log.Printf("[Reg] Warning: Failed to reindex Qdrant: %v", err)
+			}
 		}
 	}
 
@@ -160,6 +221,9 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 	// Garbage Collection Loop (Remove dead providers)
 	go reg.gcLoop()
 
+	// Stake Unfreezer Loop (Unfreeze stakes after delay)
+	go reg.stakeUnfreezer()
+
 	// Start REST API server
 	go func() {
 		router := reg.setupRESTAPI()
@@ -181,7 +245,7 @@ func (r *RegistryNode) gcLoop() {
 		now := time.Now()
 		for pid, record := range r.Registrations {
 			if now.Sub(record.LastSeen) > 90*time.Second {
-				log.Printf("[Reg] 💀 Pruning dead provider: %s (last seen %s)\n", pid.ShortString(), record.LastSeen.Format(time.RFC3339))
+				log.Printf("[Reg] Pruning dead provider: %s (last seen %s)\n", pid.ShortString(), record.LastSeen.Format(time.RFC3339))
 				delete(r.Registrations, pid)
 				r.removeFromIndex(pid, record.ServiceCard.Name)
 
@@ -192,6 +256,76 @@ func (r *RegistryNode) gcLoop() {
 			}
 		}
 		r.mu.Unlock()
+	}
+}
+
+// stakeUnfreezer periodically checks for frozen stakes that are eligible for unfreezing.
+func (r *RegistryNode) stakeUnfreezer() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for range ticker.C {
+		r.stakeMu.Lock()
+		now := time.Now().Unix()
+
+		// Find stakes that can be unfrozen
+		newFreezedStakes := make([]freezedStake, 0)
+		unfrozenCount := 0
+		modifiedPeers := make(map[peer.ID]bool) // Track which peers had changes
+
+		for _, frozen := range r.freezedStakes {
+			if frozen.CreatedAt < now-UNFREEZE_DELAY {
+				// This stake is eligible for unfreezing
+				unfrozenCount++
+				log.Printf("[Reg] Unfreezing stake %s for peer %s (frozen at %s)\n",
+					frozen.ID, frozen.PeerID.ShortString(), time.Unix(frozen.CreatedAt, 0).Format(time.RFC3339))
+
+				// Remove from freezedPeerStakes
+				if peerFrozen, exists := r.freezedPeerStakes[frozen.PeerID]; exists {
+					newPeerFrozen := make([]freezedStake, 0)
+					for _, pf := range peerFrozen {
+						if pf.ID != frozen.ID {
+							newPeerFrozen = append(newPeerFrozen, pf)
+						}
+					}
+					if len(newPeerFrozen) == 0 {
+						delete(r.freezedPeerStakes, frozen.PeerID)
+						modifiedPeers[frozen.PeerID] = true // Mark for Redis deletion
+					} else {
+						r.freezedPeerStakes[frozen.PeerID] = newPeerFrozen
+						modifiedPeers[frozen.PeerID] = true // Mark for Redis update
+					}
+				}
+			} else {
+				// Keep this stake frozen
+				newFreezedStakes = append(newFreezedStakes, frozen)
+			}
+		}
+
+		r.freezedStakes = newFreezedStakes
+
+		if unfrozenCount > 0 {
+			log.Printf("[Reg] Unfroze %d stake(s)\n", unfrozenCount)
+
+			// Persist changes to Redis
+			// Update global freezedStakes
+			if err := r.storage.SaveFreezedStakes(context.Background(), convertToStorageFreezedStakeSlice(r.freezedStakes)); err != nil {
+				log.Printf("[Reg] Warning: Failed to save global freezed stakes to Redis: %v", err)
+			}
+
+			// Update or delete freezedPeerStakes for affected peers
+			for pid := range modifiedPeers {
+				if peerFrozen, exists := r.freezedPeerStakes[pid]; exists {
+					if err := r.storage.SaveFreezedPeerStakes(context.Background(), pid, convertToStorageFreezedStakeSlice(peerFrozen)); err != nil {
+						log.Printf("[Reg] Warning: Failed to save freezed peer stakes to Redis: %v", err)
+					}
+				} else {
+					if err := r.storage.DeleteFreezedPeerStakes(context.Background(), pid); err != nil {
+						log.Printf("[Reg] Warning: Failed to delete freezed peer stakes from Redis: %v", err)
+					}
+				}
+			}
+		}
+
+		r.stakeMu.Unlock()
 	}
 }
 
@@ -246,8 +380,53 @@ func (r *RegistryNode) convertFromStorageRecord(record *storage.RegistrationReco
 	}
 }
 
+// convertToStorageFreezedStake converts main.freezedStake to storage.FreezedStake
+func convertToStorageFreezedStake(fs freezedStake) storage.FreezedStake {
+	return storage.FreezedStake{
+		ID:        fs.ID,
+		PeerID:    fs.PeerID.String(),
+		CreatedAt: fs.CreatedAt,
+	}
+}
+
+// convertFromStorageFreezedStake converts storage.FreezedStake to main.freezedStake
+func convertFromStorageFreezedStake(sfs storage.FreezedStake) (freezedStake, error) {
+	pid, err := peer.Decode(sfs.PeerID)
+	if err != nil {
+		return freezedStake{}, fmt.Errorf("failed to decode peer ID: %v", err)
+	}
+	return freezedStake{
+		ID:        sfs.ID,
+		PeerID:    pid,
+		CreatedAt: sfs.CreatedAt,
+	}, nil
+}
+
+// convertToStorageFreezedStakeSlice converts a slice of main.freezedStake to storage.FreezedStake
+func convertToStorageFreezedStakeSlice(fsList []freezedStake) []storage.FreezedStake {
+	result := make([]storage.FreezedStake, len(fsList))
+	for i, fs := range fsList {
+		result[i] = convertToStorageFreezedStake(fs)
+	}
+	return result
+}
+
+// convertFromStorageFreezedStakeSlice converts a slice of storage.FreezedStake to main.freezedStake
+func convertFromStorageFreezedStakeSlice(sfsList []storage.FreezedStake) ([]freezedStake, error) {
+	result := make([]freezedStake, 0, len(sfsList))
+	for _, sfs := range sfsList {
+		fs, err := convertFromStorageFreezedStake(sfs)
+		if err != nil {
+			log.Printf("[Reg] Warning: Failed to convert freezed stake: %v", err)
+			continue
+		}
+		result = append(result, fs)
+	}
+	return result, nil
+}
+
 // restoreStateFromRedis restores the registry state from Redis on startup.
-// It loads all registrations and rebuilds the ServiceIndex.
+// It loads all registrations, rebuilds the ServiceIndex, and restores stake data.
 func (r *RegistryNode) restoreStateFromRedis(ctx context.Context) error {
 	if r.storage == nil {
 		return nil
@@ -261,27 +440,121 @@ func (r *RegistryNode) restoreStateFromRedis(ctx context.Context) error {
 		return fmt.Errorf("failed to restore registrations: %v", err)
 	}
 
-	if len(storageRecords) == 0 {
-		log.Println("[Reg] No registrations found in Redis")
-		return nil
-	}
-
 	// Convert storage records to main records and rebuild the index
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	for pid, storageRecord := range storageRecords {
 		record := r.convertFromStorageRecord(storageRecord)
 		r.Registrations[pid] = record
 		r.addToIndex(pid, record.ServiceCard.Name)
 	}
+	r.mu.Unlock()
 
-	log.Printf("[Reg] ✅ State restored: %d active registrations", len(r.Registrations))
+	if len(storageRecords) > 0 {
+		log.Printf("[Reg] Restored %d active registrations", len(storageRecords))
+		serviceCount := len(r.ServiceIndex)
+		if serviceCount > 0 {
+			log.Printf("[Reg] Services available: %d unique services", serviceCount)
+		}
+	} else {
+		log.Println("[Reg] No registrations found in Redis")
+	}
 
-	// Log service summary
-	serviceCount := len(r.ServiceIndex)
-	if serviceCount > 0 {
-		log.Printf("[Reg] Services available: %d unique services", serviceCount)
+	// Load stake data from Redis
+	r.stakeMu.Lock()
+	defer r.stakeMu.Unlock()
+
+	// Restore peerStakes
+	peerStakes, err := r.storage.RestoreAllPeerStakes(ctx)
+	if err != nil {
+		log.Printf("[Reg] Warning: Failed to restore peer stakes from Redis: %v", err)
+	} else {
+		r.peerStakes = peerStakes
+		log.Printf("[Reg] Restored stakes for %d peers", len(peerStakes))
+	}
+
+	// Restore freezedPeerStakes
+	freezedPeerStakes, err := r.storage.RestoreAllFreezedPeerStakes(ctx)
+	if err != nil {
+		log.Printf("[Reg] Warning: Failed to restore freezed peer stakes from Redis: %v", err)
+	} else {
+		// Convert storage.FreezedStake to main.freezedStake
+		convertedFreezedPeerStakes := make(map[peer.ID][]freezedStake)
+		for pid, sfsList := range freezedPeerStakes {
+			fsList, err := convertFromStorageFreezedStakeSlice(sfsList)
+			if err != nil {
+				log.Printf("[Reg] Warning: Error converting freezed peer stakes for %s: %v", pid.ShortString(), err)
+				continue
+			}
+			convertedFreezedPeerStakes[pid] = fsList
+		}
+		r.freezedPeerStakes = convertedFreezedPeerStakes
+		log.Printf("[Reg] Restored freezed stakes for %d peers", len(convertedFreezedPeerStakes))
+	}
+
+	// Restore freezedStakes (global list)
+	freezedStakes, err := r.storage.LoadFreezedStakes(ctx)
+	if err != nil {
+		log.Printf("[Reg] Warning: Failed to restore global freezed stakes from Redis: %v", err)
+	} else {
+		fsList, err := convertFromStorageFreezedStakeSlice(freezedStakes)
+		if err != nil {
+			log.Printf("[Reg] Warning: Error converting global freezed stakes: %v", err)
+		} else {
+			r.freezedStakes = fsList
+			log.Printf("[Reg] Restored %d global freezed stakes", len(fsList))
+		}
+	}
+
+	return nil
+}
+
+func (r *RegistryNode) validateEmbedding(vec []float32) error {
+	if r.embeddingDim <= 0 {
+		return fmt.Errorf("registry embedding dim not configured")
+	}
+	if len(vec) != r.embeddingDim {
+		return fmt.Errorf("embedding length %d does not match required %d", len(vec), r.embeddingDim)
+	}
+	return nil
+}
+
+// reindexQdrant upserts all current registrations into Qdrant (used on startup restore).
+func (r *RegistryNode) reindexQdrant(ctx context.Context) error {
+	if r.qdrant == nil {
+		return nil
+	}
+
+	type item struct {
+		pid    peer.ID
+		record *RegistrationRecord
+	}
+	entries := []item{}
+
+	r.mu.Lock()
+	for pid, rec := range r.Registrations {
+		entries = append(entries, item{pid: pid, record: rec})
+	}
+	r.mu.Unlock()
+
+	for _, it := range entries {
+		if err := r.validateEmbedding(it.record.ServiceCard.Embedding); err != nil {
+			log.Printf("[Reg] Skipping Qdrant reindex for %s: %v\n", it.pid.ShortString(), err)
+			continue
+		}
+
+		payload := map[string]interface{}{
+			"service_name": it.record.ServiceCard.Name,
+			"peer_id":      it.pid.String(),
+			"description":  it.record.ServiceCard.Description,
+			"tags":         it.record.ServiceCard.Tags,
+			"version":      it.record.ServiceCard.Version,
+			"cost_per_op":  it.record.ServiceCard.CostPerOp,
+		}
+		pointID := fmt.Sprintf("%s:%s", it.pid.String(), it.record.ServiceCard.Name)
+
+		if err := r.qdrant.UpsertService(pointID, it.record.ServiceCard.Embedding, payload); err != nil {
+			log.Printf("[Reg] Qdrant upsert failed for %s: %v\n", pointID, err)
+		}
 	}
 
 	return nil
@@ -352,7 +625,7 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 				if req.ProviderInfo != nil {
 					entry.AddrInfo = *req.ProviderInfo
 				}
-				log.Printf("[Reg] ❤️ Heartbeat received: %s\n", remotePeer.ShortString())
+				log.Printf("[Reg] Heartbeat received: %s\n", remotePeer.ShortString())
 				resp.Success = true
 
 				// Save to Redis if enabled
@@ -366,24 +639,45 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 			// New registration or stake changed
 			if err := r.checkStakeValidity(remotePeer, req.StakeProof); err != nil {
 				resp.Error = err.Error()
-				log.Printf("[Reg] ❌ Stake Invalid: %v\n", err)
+				log.Printf("[Reg] Stake Invalid: %v\n", err)
 				break
 			}
 
-			// Replay protection only for NEW stake proofs
+			// Replay protection: check if this stake is already used by this peer
 			key := fmt.Sprintf("%s|%d", req.StakeProof.TxHash, req.StakeProof.Nonce)
 			r.stakeMu.Lock()
-			if r.seenStakeNonces[key] {
+			stakes := r.peerStakes[remotePeer]
+			alreadyUsed := false
+			for _, existingKey := range stakes {
+				if existingKey == key {
+					alreadyUsed = true
+					break
+				}
+			}
+			if alreadyUsed {
 				r.stakeMu.Unlock()
 				resp.Error = "stake proof already used (replay detected)"
-				log.Printf("[Reg] ❌ Replay Attack: %s\n", resp.Error)
+				log.Printf("[Reg] Replay Attack: %s\n", resp.Error)
 				break
 			}
-			r.seenStakeNonces[key] = true
+			r.peerStakes[remotePeer] = append(stakes, key)
+
+			// Persist to Redis
+			if err := r.storage.SavePeerStakes(context.Background(), remotePeer, r.peerStakes[remotePeer]); err != nil {
+				log.Printf("[Reg] Warning: Failed to save peer stakes to Redis: %v", err)
+			}
+
 			r.stakeMu.Unlock()
 
-			// Compute / fill embedding for this service (for semantic search / Qdrant)
-			embedding := buildServiceEmbedding(req.Card)
+			var embedding []float32
+			if r.qdrant != nil {
+				if err := r.validateEmbedding(req.Card.Embedding); err != nil {
+					resp.Error = fmt.Sprintf("invalid embedding: %v", err)
+					log.Printf("[Reg] Embedding invalid: %v\n", err)
+					break
+				}
+				embedding = req.Card.Embedding
+			}
 
 			r.mu.Lock()
 
@@ -409,7 +703,7 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 				}
 			}
 
-			log.Printf("[Reg] ✅ New Registration: %s (Service: %s)\n", remotePeer.ShortString(), req.Card.Name)
+			log.Printf("[Reg] New Registration: %s (Service: %s)\n", remotePeer.ShortString(), req.Card.Name)
 			resp.Success = true
 
 			r.mu.Unlock()
@@ -449,6 +743,118 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 		resp.Success = true
 		log.Printf("[Reg] Served query '%s' -> %d providers\n", req.Query, len(results))
 		r.mu.Unlock()
+
+	case "unregister":
+		if req.StakeProof == nil {
+			resp.Error = "stake proof required for unregister"
+			log.Printf("[Reg] Unregister failed: no stake proof provided\n")
+			break
+		}
+
+		// Get the stake key from the provided StakeProof
+		stakeKey := fmt.Sprintf("%s|%d", req.StakeProof.TxHash, req.StakeProof.Nonce)
+
+		r.stakeMu.Lock()
+
+		// Find and remove the stake from peerStakes
+		stakes, exists := r.peerStakes[remotePeer]
+		if !exists {
+			r.stakeMu.Unlock()
+			resp.Error = "no stakes found for peer"
+			log.Printf("[Reg] Unregister failed: no stakes for %s\n", remotePeer.ShortString())
+			break
+		}
+
+		// Check if the stake exists and remove it from peerStakes
+		found := false
+		newStakes := make([]string, 0, len(stakes))
+		for _, existingKey := range stakes {
+			if existingKey == stakeKey {
+				found = true
+			} else {
+				newStakes = append(newStakes, existingKey)
+			}
+		}
+
+		if !found {
+			r.stakeMu.Unlock()
+			resp.Error = "stake not found for this peer"
+			log.Printf("[Reg] Unregister failed: stake %s not found for %s\n", stakeKey, remotePeer.ShortString())
+			break
+		}
+
+		// Update peerStakes (or delete if no stakes left)
+		if len(newStakes) == 0 {
+			delete(r.peerStakes, remotePeer)
+			// Remove from Redis
+			if err := r.storage.DeletePeerStakes(context.Background(), remotePeer); err != nil {
+				log.Printf("[Reg] Warning: Failed to delete peer stakes from Redis: %v", err)
+			}
+		} else {
+			r.peerStakes[remotePeer] = newStakes
+			// Update in Redis
+			if err := r.storage.SavePeerStakes(context.Background(), remotePeer, newStakes); err != nil {
+				log.Printf("[Reg] Warning: Failed to save peer stakes to Redis: %v", err)
+			}
+		}
+
+		// Create frozen stake
+		now := time.Now().Unix()
+		frozen := freezedStake{
+			ID:        stakeKey,
+			PeerID:    remotePeer,
+			CreatedAt: now,
+		}
+
+		// Add to freezedPeerStakes
+		r.freezedPeerStakes[remotePeer] = append(r.freezedPeerStakes[remotePeer], frozen)
+
+		// Persist freezedPeerStakes to Redis
+		if err := r.storage.SaveFreezedPeerStakes(context.Background(), remotePeer, convertToStorageFreezedStakeSlice(r.freezedPeerStakes[remotePeer])); err != nil {
+			log.Printf("[Reg] Warning: Failed to save freezed peer stakes to Redis: %v", err)
+		}
+
+		// Add to global freezedStakes list
+		r.freezedStakes = append(r.freezedStakes, frozen)
+
+		// Persist global freezedStakes to Redis
+		if err := r.storage.SaveFreezedStakes(context.Background(), convertToStorageFreezedStakeSlice(r.freezedStakes)); err != nil {
+			log.Printf("[Reg] Warning: Failed to save global freezed stakes to Redis: %v", err)
+		}
+
+		r.stakeMu.Unlock()
+
+		// Remove service from registrations and index
+		r.mu.Lock()
+		if registration, exists := r.Registrations[remotePeer]; exists {
+			serviceName := registration.ServiceCard.Name
+
+			// Remove from the service index
+			r.removeFromIndex(remotePeer, serviceName)
+
+			// Remove from registrations
+			delete(r.Registrations, remotePeer)
+
+			// Remove from Redis storage
+			if err := r.storage.DeleteRegistration(context.Background(), remotePeer, serviceName); err != nil {
+				log.Printf("[Reg] Warning: Failed to delete registration from Redis: %v", err)
+			}
+
+			// Remove from Qdrant if enabled
+			if r.qdrant != nil {
+				pointID := fmt.Sprintf("%s:%s", remotePeer.String(), serviceName)
+				if err := r.qdrant.RemoveService(pointID); err != nil {
+					log.Printf("[Reg] Warning: Qdrant remove error: %v\n", err)
+				}
+			}
+
+			log.Printf("[Reg] Removed service %s for peer %s\n", serviceName, remotePeer.ShortString())
+		}
+		r.mu.Unlock()
+
+		resp.Success = true
+		log.Printf("[Reg] Unregistered stake %s for %s: frozen until %s\n",
+			stakeKey, remotePeer.ShortString(), time.Unix(now+UNFREEZE_DELAY, 0).Format(time.RFC3339))
 
 	default:
 		resp.Error = "Unknown method"
@@ -605,43 +1011,18 @@ func (r *RegistryNode) getServiceByName(c *gin.Context) {
 	})
 }
 
-// --- Semantic search (Qdrant-backed, optional) ---
-
-const defaultEmbeddingDim = 64
-
-// buildServiceEmbedding returns a vector for this card.
-func buildServiceEmbedding(card common.ServiceCard) []float32 {
-	textParts := []string{card.Name, card.Description}
-	if len(card.Tags) > 0 {
-		textParts = append(textParts, strings.Join(card.Tags, " "))
-	}
-	text := strings.ToLower(strings.Join(textParts, " "))
-	return simpleTextEmbedding(text, defaultEmbeddingDim)
-}
-
-// simpleTextEmbedding builds a very simple bag-of-runes embedding.
-// This is only for demo purposes; in production you'd plug a real embedding model.
-func simpleTextEmbedding(text string, dim int) []float32 {
-	if dim <= 0 {
-		dim = defaultEmbeddingDim
-	}
-	vec := make([]float32, dim)
-	for _, r := range text {
-		idx := int(r) % dim
-		if idx < 0 {
-			idx += dim
-		}
-		vec[idx] += 1.0
-	}
-	return vec
-}
-
 // semanticSearchServices exposes a Qdrant-backed semantic search endpoint.
 // GET /api/v1/services/semantic_search?q=...&k=5
 func (r *RegistryNode) semanticSearchServices(c *gin.Context) {
 	if r.qdrant == nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "semantic search is not enabled (no Qdrant configured)",
+		})
+		return
+	}
+	if r.embedder == nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "semantic search is not configured with an embedder (set embedding API key/model)",
 		})
 		return
 	}
@@ -660,7 +1041,15 @@ func (r *RegistryNode) semanticSearchServices(c *gin.Context) {
 		k = 5
 	}
 
-	vector := simpleTextEmbedding(strings.ToLower(query), defaultEmbeddingDim)
+	vector, err := r.embedder.EmbedText(c.Request.Context(), query)
+	if err != nil {
+		log.Printf("[Reg] Embed error: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": fmt.Sprintf("failed to embed query: %v", err),
+		})
+		return
+	}
+
 	results, err := r.qdrant.Search(vector, k)
 	if err != nil {
 		log.Printf("[Reg] Qdrant search error: %v\n", err)
@@ -748,6 +1137,88 @@ func (r *RegistryNode) getRegistryInfo(c *gin.Context) {
 		"multiaddrs": addrs,
 		"bootstrap":  bootstrapAddr,
 	})
+}
+
+// --- Embedding client (OpenAI-compatible) ---
+
+type EmbeddingClient struct {
+	APIKey  string
+	Model   string
+	BaseURL string
+	HTTP    *http.Client
+	Dim     int
+}
+
+type embeddingRequest struct {
+	Input string `json:"input"`
+	Model string `json:"model"`
+}
+
+type embeddingResponse struct {
+	Data []struct {
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
+}
+
+func NewEmbeddingClient(apiKey, model, baseURL string, dim int) *EmbeddingClient {
+	return &EmbeddingClient{
+		APIKey:  apiKey,
+		Model:   model,
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		HTTP:    &http.Client{Timeout: 10 * time.Second},
+		Dim:     dim,
+	}
+}
+
+func (ec *EmbeddingClient) EmbedText(ctx context.Context, text string) ([]float32, error) {
+	if ec == nil {
+		return nil, fmt.Errorf("embedding client not configured")
+	}
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("cannot embed empty text")
+	}
+
+	body := embeddingRequest{Input: text, Model: ec.Model}
+	b, _ := json.Marshal(body)
+	url := fmt.Sprintf("%s/embeddings", ec.BaseURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+ec.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := ec.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		return nil, fmt.Errorf("embedding request failed: status=%d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var er embeddingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		return nil, err
+	}
+	if len(er.Data) == 0 || len(er.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("embedding response empty")
+	}
+
+	vec64 := er.Data[0].Embedding
+
+	if ec.Dim > 0 && len(vec64) != ec.Dim {
+		return nil, fmt.Errorf("embedding length mismatch: got %d want %d", len(vec64), ec.Dim)
+	}
+
+	vec := make([]float32, len(vec64))
+	for i, v := range vec64 {
+		vec[i] = float32(v)
+	}
+	return vec, nil
 }
 
 // --- Minimal Qdrant HTTP client (for demo use only) ---
@@ -875,6 +1346,42 @@ type qdrantSearchResult struct {
 
 type qdrantSearchResponse struct {
 	Result []qdrantSearchResult `json:"result"`
+}
+
+// RemoveService deletes a service vector from Qdrant.
+func (qc *QdrantClient) RemoveService(id string) error {
+	if qc == nil {
+		return nil
+	}
+
+	// Hash the ID to match what was used in UpsertService
+	numID := hashToUint64(id)
+
+	body := map[string]interface{}{
+		"points": []uint64{numID},
+	}
+
+	b, _ := json.Marshal(body)
+	url := fmt.Sprintf("%s/collections/%s/points/delete", qc.BaseURL, qc.Collection)
+
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := qc.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		return fmt.Errorf("qdrant delete failed: status=%d body=%s", resp.StatusCode, string(bodyBytes))
+	}
+
+	return nil
 }
 
 // Search performs a vector similarity search in Qdrant.

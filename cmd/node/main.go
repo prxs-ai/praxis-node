@@ -23,6 +23,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/routing"
 
 	"prxs/common"
+	"prxs/mcp"
 )
 
 func init() {
@@ -191,7 +192,17 @@ func runStakingHelper(ctx context.Context, proofPath string, amount float64, cha
 func NewProviderDaemon(agentPath string) (*ProviderDaemon, error) {
 	log.Printf("[Daemon] Launching agent script: %s\n", agentPath)
 
-	cmd := exec.Command("python3", "-u", agentPath)
+	// Try python first (Windows), then python3
+	pythonCmd := "python"
+	if _, err := exec.LookPath("python"); err != nil {
+		// Python not found, try python3 (Unix systems)
+		if _, err := exec.LookPath("python3"); err != nil {
+			return nil, fmt.Errorf("neither 'python' nor 'python3' found in PATH")
+		}
+		pythonCmd = "python3"
+	}
+	log.Printf("[Daemon] Using Python command: %s", pythonCmd)
+	cmd := exec.Command(pythonCmd, "-u", agentPath)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -500,10 +511,43 @@ func startClient(bootstrapAddr string, query string, args string, devMode bool, 
 	fmt.Printf("\n--- RESULT ---\n%v\n--------------\n", execResp.Result)
 }
 
+// --- MCP Server Logic ---
+
+func startMCPServer(configPath string, bootstrapAddr string, devMode bool, privKey crypto.PrivKey) {
+	ctx := context.Background()
+
+	// Load MCP configuration
+	config, err := mcp.LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("[MCP] Failed to load config: %v", err)
+	}
+
+	// Create libp2p host (as client)
+	h, err := libp2p.New(common.CommonLibp2pOptions(0, privKey)...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer h.Close()
+
+	// Setup DHT
+	kademliaDHT, err := common.SetupDHT(ctx, h, []string{bootstrapAddr}, devMode)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Printf("[MCP] Node ID: %s", h.ID().ShortString())
+
+	// Create and start MCP server
+	mcpServer := mcp.NewServer(config, h, kademliaDHT)
+	if err := mcpServer.Start(ctx); err != nil {
+		log.Fatalf("[MCP] Server error: %v", err)
+	}
+}
+
 // --- Main Entry Point ---
 
 func main() {
-	mode := flag.String("mode", "provider", "provider or client")
+	mode := flag.String("mode", "provider", "provider, client, or mcp-server")
 	port := flag.Int("port", 4001, "port")
 	bootstrap := flag.String("bootstrap", "", "bootstrap multiaddr")
 	agent := flag.String("agent", "./calc.py", "agent binary")
@@ -516,6 +560,7 @@ func main() {
 	stakeProofPath := flag.String("stake-proof", "stake_proof.json", "path to stake proof file (provider only)")
 	stakeWebPort := flag.Int("stake-web-port", 8090, "port for local staking helper UI (provider only)")
 	stakeAddress := flag.String("stake-address", "0xDEADBEEF00000000000000000000000000DEMO", "display address for staking UI (provider only)")
+	mcpConfig := flag.String("mcp-config", "mcp_config.yaml", "path to MCP config file (mcp-server only)")
 	flag.Parse()
 
 	// Load Key if specified, otherwise generate ephemeral
@@ -543,7 +588,12 @@ func main() {
 			log.Fatal("Need -bootstrap")
 		}
 		startClient(*bootstrap, *query, *args, *devMode, privKey)
+	case "mcp-server":
+		if *bootstrap == "" {
+			log.Fatal("Need -bootstrap")
+		}
+		startMCPServer(*mcpConfig, *bootstrap, *devMode, privKey)
 	default:
-		log.Fatalf("Invalid mode: %s. Use 'provider' or 'client'", *mode)
+		log.Fatalf("Invalid mode: %s. Use 'provider', 'client', or 'mcp-server'", *mode)
 	}
 }
