@@ -437,6 +437,673 @@ func stringSliceToInterface(strs []string) []interface{} {
 	return result
 }
 
+// SaveEVMNonce records an EVM nonce as used.
+func (r *RedisStorage) SaveEVMNonce(ctx context.Context, walletAddr string, nonce int64) error {
+	if r == nil || r.client == nil {
+		return nil
+	}
+
+	key := fmt.Sprintf("evm_nonce:%s|%d", strings.ToLower(walletAddr), nonce)
+	if err := r.client.Set(ctx, key, "1", 0).Err(); err != nil {
+		return fmt.Errorf("failed to save EVM nonce: %v", err)
+	}
+
+	return nil
+}
+
+// CheckEVMNonce checks if an EVM nonce has been used.
+func (r *RedisStorage) CheckEVMNonce(ctx context.Context, walletAddr string, nonce int64) (bool, error) {
+	if r == nil || r.client == nil {
+		return false, nil
+	}
+
+	key := fmt.Sprintf("evm_nonce:%s|%d", strings.ToLower(walletAddr), nonce)
+	exists, err := r.client.Exists(ctx, key).Result()
+	if err != nil {
+		return false, fmt.Errorf("failed to check EVM nonce: %v", err)
+	}
+
+	return exists > 0, nil
+}
+
+// SaveWalletBinding saves a wallet-to-peerID binding.
+func (r *RedisStorage) SaveWalletBinding(ctx context.Context, walletAddr string, peerID string) error {
+	if r == nil || r.client == nil {
+		return nil
+	}
+
+	key := fmt.Sprintf("wallet_binding:%s", strings.ToLower(walletAddr))
+	if err := r.client.Set(ctx, key, peerID, 0).Err(); err != nil {
+		return fmt.Errorf("failed to save wallet binding: %v", err)
+	}
+
+	return nil
+}
+
+// LoadWalletBinding loads a wallet-to-peerID binding.
+func (r *RedisStorage) LoadWalletBinding(ctx context.Context, walletAddr string) (string, error) {
+	if r == nil || r.client == nil {
+		return "", nil
+	}
+
+	key := fmt.Sprintf("wallet_binding:%s", strings.ToLower(walletAddr))
+	peerID, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to load wallet binding: %v", err)
+	}
+
+	return peerID, nil
+}
+
+// RestoreAllWalletBindings retrieves all wallet bindings from Redis.
+func (r *RedisStorage) RestoreAllWalletBindings(ctx context.Context) (map[string]string, error) {
+	if r == nil || r.client == nil {
+		return nil, nil
+	}
+
+	bindings := make(map[string]string)
+
+	iter := r.client.Scan(ctx, 0, "wallet_binding:*", 0).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+
+		walletAddr := strings.TrimPrefix(key, "wallet_binding:")
+		peerID, err := r.client.Get(ctx, key).Result()
+		if err != nil {
+			log.Printf("[Storage] Warning: Failed to load wallet binding for %s: %v", walletAddr, err)
+			continue
+		}
+
+		bindings[walletAddr] = peerID
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("redis scan error: %v", err)
+	}
+
+	log.Printf("[Storage] Restored %d wallet bindings from Redis", len(bindings))
+	return bindings, nil
+}
+
+// RestoreAllEVMNonces retrieves all used EVM nonces from Redis.
+func (r *RedisStorage) RestoreAllEVMNonces(ctx context.Context) (map[string]bool, error) {
+	if r == nil || r.client == nil {
+		return nil, nil
+	}
+
+	nonces := make(map[string]bool)
+
+	iter := r.client.Scan(ctx, 0, "evm_nonce:*", 0).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		nonceKey := strings.TrimPrefix(key, "evm_nonce:")
+		nonces[nonceKey] = true
+	}
+
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("redis scan error: %v", err)
+	}
+
+	log.Printf("[Storage] Restored %d EVM nonces from Redis", len(nonces))
+	return nonces, nil
+}
+
+// --- Credits System ---
+
+// GetBalance retrieves the credit balance for a peer.
+func (r *RedisStorage) GetBalance(ctx context.Context, peerID string) (*common.CreditAccount, error) {
+	if r == nil || r.client == nil {
+		return nil, fmt.Errorf("redis not configured")
+	}
+
+	key := fmt.Sprintf("credit:balance:%s", peerID)
+	data, err := r.client.Get(ctx, key).Bytes()
+	if err != nil {
+		if err == redis.Nil {
+			// Return zero balance if not found
+			return &common.CreditAccount{
+				PeerID:    peerID,
+				Balance:   0,
+				UpdatedAt: time.Now().Unix(),
+			}, nil
+		}
+		return nil, fmt.Errorf("failed to get balance: %v", err)
+	}
+
+	var account common.CreditAccount
+	if err := json.Unmarshal(data, &account); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal balance: %v", err)
+	}
+
+	return &account, nil
+}
+
+// SetBalance sets the credit balance for a peer.
+func (r *RedisStorage) SetBalance(ctx context.Context, peerID string, amount float64) error {
+	if r == nil || r.client == nil {
+		return fmt.Errorf("redis not configured")
+	}
+
+	account := common.CreditAccount{
+		PeerID:    peerID,
+		Balance:   amount,
+		UpdatedAt: time.Now().Unix(),
+	}
+
+	data, err := json.Marshal(account)
+	if err != nil {
+		return fmt.Errorf("failed to marshal balance: %v", err)
+	}
+
+	key := fmt.Sprintf("credit:balance:%s", peerID)
+	if err := r.client.Set(ctx, key, data, 0).Err(); err != nil {
+		return fmt.Errorf("failed to save balance: %v", err)
+	}
+
+	log.Printf("[Storage] Set balance for %s: %.4f", peerID[:12], amount)
+	return nil
+}
+
+// AddBalance adds credits to a peer's balance (deposit).
+func (r *RedisStorage) AddBalance(ctx context.Context, peerID string, amount float64) (*common.CreditAccount, error) {
+	if r == nil || r.client == nil {
+		return nil, fmt.Errorf("redis not configured")
+	}
+
+	if amount <= 0 {
+		return nil, fmt.Errorf("amount must be positive")
+	}
+
+	// Get current balance
+	account, err := r.GetBalance(ctx, peerID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update balance
+	account.Balance += amount
+	account.UpdatedAt = time.Now().Unix()
+
+	// Save
+	if err := r.SetBalance(ctx, peerID, account.Balance); err != nil {
+		return nil, err
+	}
+
+	log.Printf("[Storage] Deposited %.4f credits to %s, new balance: %.4f", amount, peerID[:12], account.Balance)
+	return account, nil
+}
+
+// ChargeBalance transfers credits from one peer to another.
+// Returns the transaction record and error.
+func (r *RedisStorage) ChargeBalance(ctx context.Context, fromPeer, toPeer string, amount float64, service string) (*common.CreditTransaction, error) {
+	if r == nil || r.client == nil {
+		return nil, fmt.Errorf("redis not configured")
+	}
+
+	if amount <= 0 {
+		return nil, fmt.Errorf("amount must be positive")
+	}
+
+	// Get sender balance
+	fromAccount, err := r.GetBalance(ctx, fromPeer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sender balance: %v", err)
+	}
+
+	if fromAccount.Balance < amount {
+		return nil, fmt.Errorf("insufficient balance: have %.4f, need %.4f", fromAccount.Balance, amount)
+	}
+
+	// Get receiver balance
+	toAccount, err := r.GetBalance(ctx, toPeer)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get receiver balance: %v", err)
+	}
+
+	// Deduct from sender
+	fromAccount.Balance -= amount
+	if err := r.SetBalance(ctx, fromPeer, fromAccount.Balance); err != nil {
+		return nil, fmt.Errorf("failed to update sender balance: %v", err)
+	}
+
+	// Add to receiver
+	toAccount.Balance += amount
+	if err := r.SetBalance(ctx, toPeer, toAccount.Balance); err != nil {
+		// Try to rollback sender balance
+		_ = r.SetBalance(ctx, fromPeer, fromAccount.Balance+amount)
+		return nil, fmt.Errorf("failed to update receiver balance: %v", err)
+	}
+
+	// Create transaction record
+	txID := fmt.Sprintf("tx-%d-%s", time.Now().UnixNano(), fromPeer[:8])
+	tx := &common.CreditTransaction{
+		ID:        txID,
+		From:      fromPeer,
+		To:        toPeer,
+		Amount:    amount,
+		Service:   service,
+		Timestamp: time.Now().Unix(),
+	}
+
+	// Save transaction
+	if err := r.saveTransaction(ctx, tx); err != nil {
+		log.Printf("[Storage] Warning: failed to save transaction record: %v", err)
+	}
+
+	log.Printf("[Storage] Charged %.4f credits: %s -> %s for service %s", amount, fromPeer[:12], toPeer[:12], service)
+	return tx, nil
+}
+
+// saveTransaction saves a transaction record and adds it to both peers' transaction lists.
+func (r *RedisStorage) saveTransaction(ctx context.Context, tx *common.CreditTransaction) error {
+	data, err := json.Marshal(tx)
+	if err != nil {
+		return fmt.Errorf("failed to marshal transaction: %v", err)
+	}
+
+	// Save transaction record
+	txKey := fmt.Sprintf("credit:tx:%s", tx.ID)
+	if err := r.client.Set(ctx, txKey, data, 0).Err(); err != nil {
+		return fmt.Errorf("failed to save transaction: %v", err)
+	}
+
+	// Add to sender's transaction list
+	fromListKey := fmt.Sprintf("credit:tx_list:%s", tx.From)
+	if err := r.client.LPush(ctx, fromListKey, tx.ID).Err(); err != nil {
+		log.Printf("[Storage] Warning: failed to add tx to sender list: %v", err)
+	}
+
+	// Add to receiver's transaction list
+	toListKey := fmt.Sprintf("credit:tx_list:%s", tx.To)
+	if err := r.client.LPush(ctx, toListKey, tx.ID).Err(); err != nil {
+		log.Printf("[Storage] Warning: failed to add tx to receiver list: %v", err)
+	}
+
+	return nil
+}
+
+// GetTransactions retrieves the transaction history for a peer.
+func (r *RedisStorage) GetTransactions(ctx context.Context, peerID string, limit int) ([]common.CreditTransaction, error) {
+	if r == nil || r.client == nil {
+		return nil, fmt.Errorf("redis not configured")
+	}
+
+	if limit <= 0 {
+		limit = 50
+	}
+
+	listKey := fmt.Sprintf("credit:tx_list:%s", peerID)
+	txIDs, err := r.client.LRange(ctx, listKey, 0, int64(limit-1)).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return []common.CreditTransaction{}, nil
+		}
+		return nil, fmt.Errorf("failed to get transaction list: %v", err)
+	}
+
+	transactions := make([]common.CreditTransaction, 0, len(txIDs))
+	for _, txID := range txIDs {
+		txKey := fmt.Sprintf("credit:tx:%s", txID)
+		data, err := r.client.Get(ctx, txKey).Bytes()
+		if err != nil {
+			log.Printf("[Storage] Warning: failed to get transaction %s: %v", txID, err)
+			continue
+		}
+
+		var tx common.CreditTransaction
+		if err := json.Unmarshal(data, &tx); err != nil {
+			log.Printf("[Storage] Warning: failed to unmarshal transaction %s: %v", txID, err)
+			continue
+		}
+
+		transactions = append(transactions, tx)
+	}
+
+	return transactions, nil
+}
+
+// --- Settlement (Withdrawals) ---
+
+// CreateWithdrawal creates a new withdrawal request
+func (r *RedisStorage) CreateWithdrawal(
+	ctx context.Context,
+	peerID string,
+	amount float64,
+	walletAddress string,
+	chain string,
+	amountWei string,
+) (*common.WithdrawalRequest, error) {
+	now := time.Now().Unix()
+	shortID := peerID
+	if len(peerID) > 10 {
+		shortID = peerID[:10]
+	}
+
+	wdr := &common.WithdrawalRequest{
+		ID:            fmt.Sprintf("wdr-%d-%s", now, shortID),
+		PeerID:        peerID,
+		Amount:        amount,
+		AmountWei:     amountWei,
+		WalletAddress: walletAddress,
+		Chain:         chain,
+		Status:        "pending",
+		TxHash:        "",
+		CreatedAt:     now,
+		UpdatedAt:     now,
+		ErrorMessage:  "",
+	}
+
+	// Store withdrawal request
+	wdrKey := fmt.Sprintf("credit:withdrawal:%s", wdr.ID)
+	data, err := json.Marshal(wdr)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := r.client.Set(ctx, wdrKey, data, 0).Err(); err != nil {
+		return nil, err
+	}
+
+	// Add to peer's withdrawal list
+	listKey := fmt.Sprintf("credit:withdrawal_list:%s", peerID)
+	if err := r.client.RPush(ctx, listKey, wdr.ID).Err(); err != nil {
+		return nil, err
+	}
+
+	// Add to pending set
+	if err := r.client.SAdd(ctx, "credit:withdrawal_pending", wdr.ID).Err(); err != nil {
+		return nil, err
+	}
+
+	return wdr, nil
+}
+
+// GetWithdrawal retrieves a withdrawal request by ID
+func (r *RedisStorage) GetWithdrawal(
+	ctx context.Context,
+	requestID string,
+) (*common.WithdrawalRequest, error) {
+	wdrKey := fmt.Sprintf("credit:withdrawal:%s", requestID)
+	data, err := r.client.Get(ctx, wdrKey).Bytes()
+	if err == redis.Nil {
+		return nil, fmt.Errorf("withdrawal not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var wdr common.WithdrawalRequest
+	if err := json.Unmarshal(data, &wdr); err != nil {
+		return nil, err
+	}
+
+	return &wdr, nil
+}
+
+// UpdateWithdrawalStatus updates the status of a withdrawal request
+func (r *RedisStorage) UpdateWithdrawalStatus(
+	ctx context.Context,
+	requestID string,
+	status string,
+	txHash string,
+	errorMsg string,
+) error {
+	wdr, err := r.GetWithdrawal(ctx, requestID)
+	if err != nil {
+		return err
+	}
+
+	wdr.Status = status
+	wdr.TxHash = txHash
+	wdr.ErrorMessage = errorMsg
+	wdr.UpdatedAt = time.Now().Unix()
+
+	// Update withdrawal request
+	wdrKey := fmt.Sprintf("credit:withdrawal:%s", requestID)
+	data, err := json.Marshal(wdr)
+	if err != nil {
+		return err
+	}
+
+	if err := r.client.Set(ctx, wdrKey, data, 0).Err(); err != nil {
+		return err
+	}
+
+	// Remove from pending set if completed or failed
+	if status == "completed" || status == "failed" {
+		if err := r.client.SRem(ctx, "credit:withdrawal_pending", requestID).Err(); err != nil {
+			log.Printf("[Storage] Warning: failed to remove from pending set: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// GetWithdrawals retrieves withdrawal history for a peer
+func (r *RedisStorage) GetWithdrawals(
+	ctx context.Context,
+	peerID string,
+	limit int,
+) ([]common.WithdrawalRequest, error) {
+	listKey := fmt.Sprintf("credit:withdrawal_list:%s", peerID)
+
+	// Get withdrawal IDs (most recent first)
+	var wdrIDs []string
+	var err error
+	if limit > 0 {
+		wdrIDs, err = r.client.LRange(ctx, listKey, -int64(limit), -1).Result()
+	} else {
+		wdrIDs, err = r.client.LRange(ctx, listKey, 0, -1).Result()
+	}
+
+	if err == redis.Nil {
+		return []common.WithdrawalRequest{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Reverse to show most recent first
+	for i, j := 0, len(wdrIDs)-1; i < j; i, j = i+1, j-1 {
+		wdrIDs[i], wdrIDs[j] = wdrIDs[j], wdrIDs[i]
+	}
+
+	withdrawals := make([]common.WithdrawalRequest, 0, len(wdrIDs))
+	for _, wdrID := range wdrIDs {
+		wdrKey := fmt.Sprintf("credit:withdrawal:%s", wdrID)
+		data, err := r.client.Get(ctx, wdrKey).Bytes()
+		if err != nil {
+			log.Printf("[Storage] Warning: failed to get withdrawal %s: %v", wdrID, err)
+			continue
+		}
+
+		var wdr common.WithdrawalRequest
+		if err := json.Unmarshal(data, &wdr); err != nil {
+			log.Printf("[Storage] Warning: failed to unmarshal withdrawal %s: %v", wdrID, err)
+			continue
+		}
+
+		withdrawals = append(withdrawals, wdr)
+	}
+
+	return withdrawals, nil
+}
+
+// GetPendingWithdrawals retrieves all pending withdrawal requests
+func (r *RedisStorage) GetPendingWithdrawals(ctx context.Context) ([]common.WithdrawalRequest, error) {
+	// Get all pending withdrawal IDs
+	wdrIDs, err := r.client.SMembers(ctx, "credit:withdrawal_pending").Result()
+	if err == redis.Nil {
+		return []common.WithdrawalRequest{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	withdrawals := make([]common.WithdrawalRequest, 0, len(wdrIDs))
+	for _, wdrID := range wdrIDs {
+		wdr, err := r.GetWithdrawal(ctx, wdrID)
+		if err != nil {
+			log.Printf("[Storage] Warning: failed to get pending withdrawal %s: %v", wdrID, err)
+			continue
+		}
+
+		withdrawals = append(withdrawals, *wdr)
+	}
+
+	return withdrawals, nil
+}
+
+// --- Blockchain Deposits ---
+
+// RecordDeposit stores a deposit record and credits the peer
+func (r *RedisStorage) RecordDeposit(
+	ctx context.Context,
+	txHash string,
+	fromAddress string,
+	peerID string,
+	amountWei string,
+	amountCredits float64,
+	blockNumber uint64,
+) (*common.DepositRecord, error) {
+	now := time.Now().Unix()
+	shortTx := txHash
+	if len(txHash) > 12 {
+		shortTx = txHash[:12]
+	}
+
+	deposit := &common.DepositRecord{
+		ID:            fmt.Sprintf("dep-%d-%s", now, shortTx),
+		TxHash:        txHash,
+		FromAddress:   fromAddress,
+		PeerID:        peerID,
+		AmountWei:     amountWei,
+		AmountCredits: amountCredits,
+		BlockNumber:   blockNumber,
+		Timestamp:     now,
+	}
+
+	// Store deposit record
+	depKey := fmt.Sprintf("credit:deposit:%s", deposit.ID)
+	data, err := json.Marshal(deposit)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := r.client.Set(ctx, depKey, data, 0).Err(); err != nil {
+		return nil, err
+	}
+
+	// Add to peer's deposit list
+	listKey := fmt.Sprintf("credit:deposit_list:%s", peerID)
+	if err := r.client.RPush(ctx, listKey, deposit.ID).Err(); err != nil {
+		return nil, err
+	}
+
+	// Mark tx as processed (prevent double processing)
+	processedKey := fmt.Sprintf("credit:deposit_tx:%s", txHash)
+	if err := r.client.Set(ctx, processedKey, deposit.ID, 0).Err(); err != nil {
+		return nil, err
+	}
+
+	// Add credits to peer balance
+	_, err = r.AddBalance(ctx, peerID, amountCredits)
+	if err != nil {
+		return nil, fmt.Errorf("failed to credit balance: %w", err)
+	}
+
+	return deposit, nil
+}
+
+// IsDepositProcessed checks if a deposit tx has already been processed
+func (r *RedisStorage) IsDepositProcessed(ctx context.Context, txHash string) (bool, error) {
+	processedKey := fmt.Sprintf("credit:deposit_tx:%s", txHash)
+	exists, err := r.client.Exists(ctx, processedKey).Result()
+	if err != nil {
+		return false, err
+	}
+	return exists > 0, nil
+}
+
+// GetDeposit retrieves a deposit record by ID
+func (r *RedisStorage) GetDeposit(ctx context.Context, depositID string) (*common.DepositRecord, error) {
+	depKey := fmt.Sprintf("credit:deposit:%s", depositID)
+	data, err := r.client.Get(ctx, depKey).Bytes()
+	if err == redis.Nil {
+		return nil, fmt.Errorf("deposit not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var deposit common.DepositRecord
+	if err := json.Unmarshal(data, &deposit); err != nil {
+		return nil, err
+	}
+
+	return &deposit, nil
+}
+
+// GetDeposits retrieves deposit history for a peer
+func (r *RedisStorage) GetDeposits(ctx context.Context, peerID string, limit int) ([]common.DepositRecord, error) {
+	listKey := fmt.Sprintf("credit:deposit_list:%s", peerID)
+
+	var depIDs []string
+	var err error
+	if limit > 0 {
+		depIDs, err = r.client.LRange(ctx, listKey, -int64(limit), -1).Result()
+	} else {
+		depIDs, err = r.client.LRange(ctx, listKey, 0, -1).Result()
+	}
+
+	if err == redis.Nil {
+		return []common.DepositRecord{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Reverse to show most recent first
+	for i, j := 0, len(depIDs)-1; i < j; i, j = i+1, j-1 {
+		depIDs[i], depIDs[j] = depIDs[j], depIDs[i]
+	}
+
+	deposits := make([]common.DepositRecord, 0, len(depIDs))
+	for _, depID := range depIDs {
+		dep, err := r.GetDeposit(ctx, depID)
+		if err != nil {
+			log.Printf("[Storage] Warning: failed to get deposit %s: %v", depID, err)
+			continue
+		}
+		deposits = append(deposits, *dep)
+	}
+
+	return deposits, nil
+}
+
+// GetLastProcessedBlock returns the last block number that was processed for deposits
+func (r *RedisStorage) GetLastProcessedBlock(ctx context.Context) (uint64, error) {
+	data, err := r.client.Get(ctx, "credit:deposit_last_block").Result()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	var block uint64
+	_, err = fmt.Sscanf(data, "%d", &block)
+	return block, err
+}
+
+// SetLastProcessedBlock stores the last block number that was processed
+func (r *RedisStorage) SetLastProcessedBlock(ctx context.Context, blockNumber uint64) error {
+	return r.client.Set(ctx, "credit:deposit_last_block", fmt.Sprintf("%d", blockNumber), 0).Err()
+}
+
 // Close closes the Redis connection.
 func (r *RedisStorage) Close() error {
 	if r == nil || r.client == nil {

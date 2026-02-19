@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"strconv"
@@ -30,7 +31,10 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 
 	"prxs/common"
+	"prxs/staking"
 	"prxs/storage"
+
+	ethcommon "github.com/ethereum/go-ethereum/common"
 )
 
 // RegistrationRecord tracks an active provider session.
@@ -51,28 +55,51 @@ type freezedStake struct {
 // UNFREEZE_DELAY is the duration (in seconds) a stake must remain frozen before unfreezing.
 const UNFREEZE_DELAY = 7 * 86400 // 7 days
 
-// RegistryNode holds the state of the marketplace
+type evmStakingVerifier interface {
+	GetChainID() *big.Int
+	VerifyWalletSignature(walletAddr string, signature []byte, message string) (bool, error)
+	GetBoundPeerID(walletAddr string) (string, bool)
+	GetBoundWallet(peerID string) (string, bool)
+	IsValidStaker(ctx context.Context, walletAddr ethcommon.Address) (bool, error)
+	CheckAndRecordNonce(walletAddr string, nonce int64) (bool, error)
+	IsNonceUsedAsHeartbeat(walletAddr string, nonce int64, expectedPeerID string) bool
+	RecordWalletBinding(walletAddr string, peerID string) error
+}
+
 type RegistryNode struct {
 	Host host.Host
 
-	// Core state: PeerID -> active session
 	Registrations map[peer.ID]*RegistrationRecord
-	// Lookup index: ServiceName -> PeerIDs
-	ServiceIndex map[string][]peer.ID
+	ServiceIndex  map[string][]peer.ID
 
 	mu sync.Mutex
 
 	minStake          float64
-	seenStakeNonces   map[string]bool            // Replay protection for stake nonces
-	peerStakes        map[peer.ID][]string       // PeerID -> list of stake IDs
-	freezedPeerStakes map[peer.ID][]freezedStake // PeerID -> list of frozen stakes
-	freezedStakes     []freezedStake             // All frozen stakes for periodic cleanup
+	peerStakes        map[peer.ID][]string
+	freezedPeerStakes map[peer.ID][]freezedStake
+	freezedStakes     []freezedStake
 	stakeMu           sync.Mutex
 
 	qdrant       *QdrantClient
 	storage      *storage.RedisStorage
 	embeddingDim int
 	embedder     *EmbeddingClient
+
+	stakingMode        string
+	evmVerifier        evmStakingVerifier
+	evmContractAddress ethcommon.Address
+
+	// Settlement
+	ethClient             *EthereumClient
+	settlementEnabled     bool
+	settlementRate        float64
+	settlementMinAmount   float64
+	settlementConfirms    int
+	settlementChain       string
+
+	// Deposit
+	depositEnabled  bool
+	depositContract string
 }
 
 func main() {
@@ -84,7 +111,8 @@ func main() {
 	bootstrap := flag.String("bootstrap", "", "bootstrap multiaddr")
 	keyFile := flag.String("key", "", "path to key file (e.g. registry.key)")
 	devMode := flag.Bool("dev", true, "Enable LAN/Dev mode")
-	minStake := flag.Float64("min-stake", 10.0, "minimum stake required to register")
+	announceIP := flag.String("announce", "", "Public IP to announce (e.g., 164.90.233.252) - for Docker/NAT environments")
+	minStake := flag.Float64("min-stake", 10.0, "minimum stake required to register (mock mode only)")
 	qdrantEnabled := flag.Bool("qdrant-enabled", false, "enable Qdrant semantic index")
 	qdrantURL := flag.String("qdrant-url", "http://localhost:6333", "Qdrant base URL")
 	qdrantCollection := flag.String("qdrant-collection", "prxs_services", "Qdrant collection name")
@@ -93,6 +121,25 @@ func main() {
 	embeddingModel := flag.String("embedding-model", "text-embedding-3-small", "Embedding model name (used for query embeddings)")
 	embeddingBaseURL := flag.String("embedding-base-url", "https://api.openai.com/v1", "Embedding API base URL")
 	embeddingAPIKey := flag.String("embedding-api-key", "", "Embedding API key (default: OPENAI_API_KEY env)")
+	stakingMode := flag.String("staking-mode", "mock", "staking verification mode: mock, evm, or hybrid")
+	evmRPCURL := flag.String("evm-rpc-url", "", "EVM RPC URL for on-chain stake verification")
+	evmChainID := flag.Int64("evm-chain-id", 1, "EVM chain ID (default: 1 Mainnet, use 11155111 for Sepolia)")
+	stakingContract := flag.String("staking-contract", "", "PRXSStaking contract address for on-chain verification")
+	stakeCacheTTL := flag.Duration("stake-cache-ttl", 60*time.Second, "TTL for stake verification cache")
+
+	// Settlement configuration
+	settlementEnabled := flag.Bool("settlement-enabled", false, "enable settlement (credit withdrawal to blockchain)")
+	settlementRPCURL := flag.String("settlement-rpc-url", "", "Settlement RPC URL (e.g., https://sepolia.infura.io/v3/YOUR_KEY)")
+	settlementPrivateKey := flag.String("settlement-private-key", "", "Settlement wallet private key (hex, without 0x)")
+	settlementRate := flag.Float64("settlement-rate", 0.0001, "1 credit = X ETH (default: 0.0001)")
+	settlementMinAmount := flag.Float64("settlement-min-amount", 10.0, "minimum credits for withdrawal")
+	settlementConfirms := flag.Int("settlement-confirms", 3, "number of block confirmations to wait")
+	settlementChain := flag.String("settlement-chain", "sepolia", "blockchain for settlement")
+
+	// Deposit configuration (blockchain deposit -> credits)
+	depositEnabled := flag.Bool("deposit-enabled", false, "enable blockchain deposits (ETH -> credits)")
+	depositContract := flag.String("deposit-contract", "", "PRXSDeposit contract address")
+
 	flag.Parse()
 
 	// Load Key if specified, otherwise generate ephemeral
@@ -124,13 +171,22 @@ func main() {
 		baseURL = "https://openrouter.ai/api/v1"
 	}
 
-	startRegistry(*port, *apiPort, *bootstrap, *devMode, *minStake, privKey, *qdrantURL, *qdrantCollection, *qdrantEnabled, *redisAddr, *embeddingDim, *embeddingModel, baseURL, key)
+	startRegistry(*port, *apiPort, *bootstrap, *devMode, *minStake, privKey, *announceIP, *qdrantURL, *qdrantCollection, *qdrantEnabled, *redisAddr, *embeddingDim, *embeddingModel, baseURL, key, *stakingMode, *evmRPCURL, *evmChainID, *stakingContract, *stakeCacheTTL, *settlementEnabled, *settlementRPCURL, *settlementPrivateKey, *settlementRate, *settlementMinAmount, *settlementConfirms, *settlementChain, *depositEnabled, *depositContract)
 }
 
-func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, minStake float64, privKey crypto.PrivKey, qdrantURL, qdrantCollection string, qdrantEnabled bool, redisAddr string, embeddingDim int, embeddingModel, embeddingBaseURL, embeddingAPIKey string) {
+func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, minStake float64, privKey crypto.PrivKey, announceIP string, qdrantURL, qdrantCollection string, qdrantEnabled bool, redisAddr string, embeddingDim int, embeddingModel, embeddingBaseURL, embeddingAPIKey string, stakingMode string, evmRPCURL string, evmChainID int64, stakingContract string, stakeCacheTTL time.Duration, settlementEnabled bool, settlementRPCURL string, settlementPrivateKey string, settlementRate float64, settlementMinAmount float64, settlementConfirms int, settlementChain string, depositEnabled bool, depositContract string) {
+
 	ctx := context.Background()
 
-	h, err := libp2p.New(common.CommonLibp2pOptions(port, privKey)...)
+	var h host.Host
+	var err error
+
+	if announceIP != "" {
+		log.Printf("[Reg] Using announce IP: %s", announceIP)
+		h, err = libp2p.New(common.CommonLibp2pOptionsWithAnnounce(port, privKey, announceIP)...)
+	} else {
+		h, err = libp2p.New(common.CommonLibp2pOptions(port, privKey)...)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -153,7 +209,6 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 		embedder = NewEmbeddingClient(embeddingAPIKey, embeddingModel, embeddingBaseURL, embeddingDim)
 	}
 
-	// Initialize Redis storage if address is provided
 	redisStorage, err := storage.NewRedisStorage(redisAddr, 120*time.Second)
 	if err != nil {
 		log.Printf("[Reg] Warning: Failed to initialize Redis storage: %v", err)
@@ -161,19 +216,72 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 		redisStorage = nil
 	}
 
+	var evmVerifier evmStakingVerifier
+	var evmContractAddress ethcommon.Address
+	if stakingMode == "evm" || stakingMode == "hybrid" {
+		if evmRPCURL == "" || stakingContract == "" {
+			log.Fatalf("[Reg] EVM staking mode requires -evm-rpc-url and -staking-contract flags")
+		}
+		if !ethcommon.IsHexAddress(stakingContract) {
+			log.Fatalf("[Reg] Invalid staking contract address: %s", stakingContract)
+		}
+		evmContractAddress = ethcommon.HexToAddress(stakingContract)
+		evmVerifier, err = staking.NewEVMStakingVerifier(evmRPCURL, stakingContract, evmChainID, stakeCacheTTL, redisStorage)
+		if err != nil {
+			log.Fatalf("[Reg] Failed to initialize EVM staking verifier: %v", err)
+		}
+		log.Printf("[Reg] EVM staking enabled: chain=%d contract=%s mode=%s", evmChainID, evmContractAddress.Hex(), stakingMode)
+	}
+
+	// Initialize Ethereum client for settlement if enabled
+	var ethClient *EthereumClient
+	if settlementEnabled {
+		if settlementRPCURL == "" || settlementPrivateKey == "" {
+			log.Fatalf("[Settlement] Error: settlement-rpc-url and settlement-private-key are required when settlement is enabled")
+		}
+
+		ethClient, err = NewEthereumClient(settlementRPCURL, settlementPrivateKey)
+		if err != nil {
+			log.Fatalf("[Settlement] Failed to initialize Ethereum client: %v", err)
+		}
+
+		log.Printf("[Settlement] Ethereum client initialized: chain=%s wallet=%s", settlementChain, ethClient.GetAddress())
+
+		// Check balance
+		balance, err := ethClient.GetBalance(ctx)
+		if err != nil {
+			log.Printf("[Settlement] Warning: Failed to get wallet balance: %v", err)
+		} else {
+			ethBalance := new(big.Float).Quo(new(big.Float).SetInt(balance), big.NewFloat(1e18))
+			log.Printf("[Settlement] Wallet balance: %s ETH", ethBalance.Text('f', 6))
+		}
+	}
+
 	reg := &RegistryNode{
-		Host:              h,
-		Registrations:     make(map[peer.ID]*RegistrationRecord),
-		ServiceIndex:      make(map[string][]peer.ID),
-		minStake:          minStake,
-		seenStakeNonces:   make(map[string]bool),
-		peerStakes:        make(map[peer.ID][]string),
-		freezedPeerStakes: make(map[peer.ID][]freezedStake),
-		freezedStakes:     make([]freezedStake, 0),
-		qdrant:            qdrant,
-		storage:           redisStorage,
-		embeddingDim:      embeddingDim,
-		embedder:          embedder,
+		Host:               h,
+		Registrations:      make(map[peer.ID]*RegistrationRecord),
+		ServiceIndex:       make(map[string][]peer.ID),
+		minStake:           minStake,
+		peerStakes:         make(map[peer.ID][]string),
+		freezedPeerStakes:  make(map[peer.ID][]freezedStake),
+		freezedStakes:      make([]freezedStake, 0),
+		qdrant:             qdrant,
+		storage:            redisStorage,
+		embeddingDim:       embeddingDim,
+		embedder:           embedder,
+		stakingMode:        stakingMode,
+		evmVerifier:        evmVerifier,
+		evmContractAddress: evmContractAddress,
+		// Settlement
+		ethClient:           ethClient,
+		settlementEnabled:   settlementEnabled,
+		settlementRate:      settlementRate,
+		settlementMinAmount: settlementMinAmount,
+		settlementConfirms:  settlementConfirms,
+		settlementChain:     settlementChain,
+		// Deposit
+		depositEnabled:  depositEnabled,
+		depositContract: depositContract,
 	}
 
 	// Restore state from Redis if enabled
@@ -224,6 +332,17 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 	// Stake Unfreezer Loop (Unfreeze stakes after delay)
 	go reg.stakeUnfreezer()
 
+	// Settlement Withdrawal Processor (if enabled)
+	if settlementEnabled {
+		go reg.withdrawalProcessor()
+	}
+
+	// Deposit Watcher (if enabled)
+	if depositEnabled && ethClient != nil && depositContract != "" {
+		log.Printf("[Deposit] Watcher enabled: contract=%s", depositContract)
+		go reg.depositWatcher()
+	}
+
 	// Start REST API server
 	go func() {
 		router := reg.setupRESTAPI()
@@ -245,7 +364,7 @@ func (r *RegistryNode) gcLoop() {
 		now := time.Now()
 		for pid, record := range r.Registrations {
 			if now.Sub(record.LastSeen) > 90*time.Second {
-				log.Printf("[Reg] Pruning dead provider: %s (last seen %s)\n", pid.ShortString(), record.LastSeen.Format(time.RFC3339))
+				log.Printf("[Reg] 💀 Pruning dead provider: %s (last seen %s)\n", pid.ShortString(), record.LastSeen.Format(time.RFC3339))
 				delete(r.Registrations, pid)
 				r.removeFromIndex(pid, record.ServiceCard.Name)
 
@@ -275,7 +394,7 @@ func (r *RegistryNode) stakeUnfreezer() {
 			if frozen.CreatedAt < now-UNFREEZE_DELAY {
 				// This stake is eligible for unfreezing
 				unfrozenCount++
-				log.Printf("[Reg] Unfreezing stake %s for peer %s (frozen at %s)\n",
+				log.Printf("[Reg] ❄️  Unfreezing stake %s for peer %s (frozen at %s)\n",
 					frozen.ID, frozen.PeerID.ShortString(), time.Unix(frozen.CreatedAt, 0).Format(time.RFC3339))
 
 				// Remove from freezedPeerStakes
@@ -303,7 +422,7 @@ func (r *RegistryNode) stakeUnfreezer() {
 		r.freezedStakes = newFreezedStakes
 
 		if unfrozenCount > 0 {
-			log.Printf("[Reg] Unfroze %d stake(s)\n", unfrozenCount)
+			log.Printf("[Reg] 🔓 Unfroze %d stake(s)\n", unfrozenCount)
 
 			// Persist changes to Redis
 			// Update global freezedStakes
@@ -450,7 +569,7 @@ func (r *RegistryNode) restoreStateFromRedis(ctx context.Context) error {
 	r.mu.Unlock()
 
 	if len(storageRecords) > 0 {
-		log.Printf("[Reg] Restored %d active registrations", len(storageRecords))
+		log.Printf("[Reg] ✅ Restored %d active registrations", len(storageRecords))
 		serviceCount := len(r.ServiceIndex)
 		if serviceCount > 0 {
 			log.Printf("[Reg] Services available: %d unique services", serviceCount)
@@ -469,7 +588,7 @@ func (r *RegistryNode) restoreStateFromRedis(ctx context.Context) error {
 		log.Printf("[Reg] Warning: Failed to restore peer stakes from Redis: %v", err)
 	} else {
 		r.peerStakes = peerStakes
-		log.Printf("[Reg] Restored stakes for %d peers", len(peerStakes))
+		log.Printf("[Reg] ✅ Restored stakes for %d peers", len(peerStakes))
 	}
 
 	// Restore freezedPeerStakes
@@ -488,7 +607,7 @@ func (r *RegistryNode) restoreStateFromRedis(ctx context.Context) error {
 			convertedFreezedPeerStakes[pid] = fsList
 		}
 		r.freezedPeerStakes = convertedFreezedPeerStakes
-		log.Printf("[Reg] Restored freezed stakes for %d peers", len(convertedFreezedPeerStakes))
+		log.Printf("[Reg] ✅ Restored freezed stakes for %d peers", len(convertedFreezedPeerStakes))
 	}
 
 	// Restore freezedStakes (global list)
@@ -501,7 +620,7 @@ func (r *RegistryNode) restoreStateFromRedis(ctx context.Context) error {
 			log.Printf("[Reg] Warning: Error converting global freezed stakes: %v", err)
 		} else {
 			r.freezedStakes = fsList
-			log.Printf("[Reg] Restored %d global freezed stakes", len(fsList))
+			log.Printf("[Reg] ✅ Restored %d global freezed stakes", len(fsList))
 		}
 	}
 
@@ -564,15 +683,27 @@ func (r *RegistryNode) reindexQdrant(ctx context.Context) error {
 // This is used for both new registrations and verifying stored heartbeats.
 func (r *RegistryNode) checkStakeValidity(remote peer.ID, proof *common.StakeProof) error {
 	if proof == nil {
-		return fmt.Errorf("stake proof required (min %.2f)", r.minStake)
-	}
-
-	if proof.Amount < r.minStake {
-		return fmt.Errorf("stake too low: have %.2f need %.2f", proof.Amount, r.minStake)
+		return fmt.Errorf("stake proof required")
 	}
 
 	if proof.Staker != "" && proof.Staker != remote.String() {
 		return fmt.Errorf("stake staker mismatch (expected %s got %s)", remote.ShortString(), proof.Staker)
+	}
+
+	if proof.IsEVMMode() {
+		return r.checkEVMStakeValidity(remote, proof)
+	}
+
+	return r.checkMockStakeValidity(remote, proof)
+}
+
+func (r *RegistryNode) checkMockStakeValidity(remote peer.ID, proof *common.StakeProof) error {
+	if r.stakingMode == "evm" {
+		return fmt.Errorf("mock stake proofs not accepted (registry in EVM-only mode)")
+	}
+
+	if proof.Amount < r.minStake {
+		return fmt.Errorf("stake too low: have %.2f need %.2f", proof.Amount, r.minStake)
 	}
 
 	pubKey := r.Host.Peerstore().PubKey(remote)
@@ -592,6 +723,166 @@ func (r *RegistryNode) checkStakeValidity(remote peer.ID, proof *common.StakePro
 	return nil
 }
 
+func (r *RegistryNode) checkEVMStakeValidity(remote peer.ID, proof *common.StakeProof) error {
+	if r.evmVerifier == nil {
+		return fmt.Errorf("EVM verification not configured")
+	}
+
+	if proof.WalletAddress == "" {
+		return fmt.Errorf("wallet address required for EVM mode")
+	}
+
+	if len(proof.WalletSignature) == 0 {
+		return fmt.Errorf("wallet signature required for EVM mode")
+	}
+
+	expectedChainID := r.evmVerifier.GetChainID().Int64()
+	if proof.EvmChainID != expectedChainID {
+		return fmt.Errorf("chain ID mismatch: proof has %d, registry expects %d", proof.EvmChainID, expectedChainID)
+	}
+
+	if proof.StakingContract == "" {
+		return fmt.Errorf("staking contract required for EVM mode")
+	}
+	if !ethcommon.IsHexAddress(proof.StakingContract) {
+		return fmt.Errorf("staking contract address invalid")
+	}
+	if (r.evmContractAddress == ethcommon.Address{}) {
+		return fmt.Errorf("registry staking contract not configured")
+	}
+	proofContract := ethcommon.HexToAddress(proof.StakingContract)
+	if proofContract != r.evmContractAddress {
+		return fmt.Errorf("staking contract mismatch: proof has %s, registry expects %s", proofContract.Hex(), r.evmContractAddress.Hex())
+	}
+
+	if proof.WalletExpiresAt > 0 && time.Now().Unix() > proof.WalletExpiresAt {
+		return fmt.Errorf("wallet binding signature expired")
+	}
+
+	expectedMessage := proof.GetWalletBindingMessage()
+	valid, err := r.evmVerifier.VerifyWalletSignature(proof.WalletAddress, proof.WalletSignature, expectedMessage)
+	if err != nil {
+		return fmt.Errorf("wallet signature verification failed: %v", err)
+	}
+	if !valid {
+		return fmt.Errorf("wallet signature invalid")
+	}
+
+	if existingPeerID, bound := r.evmVerifier.GetBoundPeerID(proof.WalletAddress); bound {
+		if existingPeerID != remote.String() {
+			return fmt.Errorf("wallet %s already bound to peer %s", proof.WalletAddress, existingPeerID)
+		}
+	}
+
+	if boundWallet, bound := r.evmVerifier.GetBoundWallet(remote.String()); bound {
+		walletAddr := ethcommon.HexToAddress(proof.WalletAddress)
+		boundAddr := ethcommon.HexToAddress(boundWallet)
+		if boundAddr != walletAddr {
+			return fmt.Errorf("peer %s already bound to wallet %s", remote.ShortString(), boundAddr.Hex())
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	walletAddr := ethcommon.HexToAddress(proof.WalletAddress)
+	isValid, err := r.evmVerifier.IsValidStaker(ctx, walletAddr)
+	if err != nil {
+		return fmt.Errorf("on-chain stake verification failed: %v", err)
+	}
+	if !isValid {
+		return fmt.Errorf("wallet %s has no valid stake on-chain", proof.WalletAddress)
+	}
+
+	return nil
+}
+
+func (r *RegistryNode) isHeartbeat(existing *RegistrationRecord, isRegistered bool, proof *common.StakeProof) bool {
+	if !isRegistered || existing == nil || existing.StakeProof == nil || proof == nil {
+		return false
+	}
+
+	existingIsEVM := existing.StakeProof.IsEVMMode()
+	incomingIsEVM := proof.IsEVMMode()
+
+	if existingIsEVM || incomingIsEVM {
+		if !existingIsEVM || !incomingIsEVM {
+			return false
+		}
+		if existing.StakeProof.WalletAddress == "" || proof.WalletAddress == "" {
+			return false
+		}
+		existingAddr := ethcommon.HexToAddress(existing.StakeProof.WalletAddress)
+		incomingAddr := ethcommon.HexToAddress(proof.WalletAddress)
+		return existingAddr == incomingAddr &&
+			existing.StakeProof.WalletNonce == proof.WalletNonce
+	}
+
+	return existing.StakeProof.TxHash == proof.TxHash
+}
+
+func (r *RegistryNode) applyHeartbeat(remote peer.ID, providerInfo *peer.AddrInfo) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	entry, ok := r.Registrations[remote]
+	if !ok {
+		return false
+	}
+
+	entry.LastSeen = time.Now()
+	if providerInfo != nil {
+		entry.AddrInfo = *providerInfo
+	}
+
+	storageRecord := r.convertToStorageRecord(entry)
+	if err := r.storage.SaveRegistration(context.Background(), remote, storageRecord); err != nil {
+		log.Printf("[Reg] Warning: Failed to save heartbeat to Redis: %v", err)
+	}
+
+	return true
+}
+
+func (r *RegistryNode) checkAndRecordReplay(remotePeer peer.ID, proof *common.StakeProof) (string, error) {
+	var key string
+
+	if proof.IsEVMMode() {
+		key = fmt.Sprintf("evm|%s|%d", strings.ToLower(proof.WalletAddress), proof.WalletNonce)
+
+		if r.evmVerifier != nil {
+			isNew, err := r.evmVerifier.CheckAndRecordNonce(proof.WalletAddress, proof.WalletNonce)
+			if err != nil {
+				return "", fmt.Errorf("nonce check failed: %w", err)
+			}
+			if !isNew {
+				if r.evmVerifier.IsNonceUsedAsHeartbeat(proof.WalletAddress, proof.WalletNonce, remotePeer.String()) {
+					return key, nil
+				}
+				return "", fmt.Errorf("wallet nonce already used (replay detected)")
+			}
+		}
+	} else {
+		key = fmt.Sprintf("mock|%s|%d", proof.TxHash, proof.Nonce)
+
+		r.stakeMu.Lock()
+		defer r.stakeMu.Unlock()
+
+		stakes := r.peerStakes[remotePeer]
+		for _, existingKey := range stakes {
+			if existingKey == key {
+				return "", fmt.Errorf("stake proof already used (replay detected)")
+			}
+		}
+		r.peerStakes[remotePeer] = append(stakes, key)
+
+		if err := r.storage.SavePeerStakes(context.Background(), remotePeer, r.peerStakes[remotePeer]); err != nil {
+			log.Printf("[Reg] Warning: Failed to save peer stakes to Redis: %v", err)
+		}
+	}
+
+	return key, nil
+}
+
 func (r *RegistryNode) handleStream(stream network.Stream) {
 	defer stream.Close()
 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
@@ -606,74 +897,46 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 
 	switch req.Method {
 	case "register":
-		// Decide whether this is a new registration or a heartbeat
 		r.mu.Lock()
 		existing, isRegistered := r.Registrations[remotePeer]
 		r.mu.Unlock()
 
-		isHeartbeat := false
-		if isRegistered && existing.StakeProof != nil && req.StakeProof != nil &&
-			existing.StakeProof.TxHash == req.StakeProof.TxHash {
-			isHeartbeat = true
-		}
+		isHeartbeat := r.isHeartbeat(existing, isRegistered, req.StakeProof)
 
 		if isHeartbeat {
-			// Heartbeat: update LastSeen and optionally AddrInfo
-			r.mu.Lock()
-			if entry, ok := r.Registrations[remotePeer]; ok {
-				entry.LastSeen = time.Now()
-				if req.ProviderInfo != nil {
-					entry.AddrInfo = *req.ProviderInfo
-				}
-				log.Printf("[Reg] Heartbeat received: %s\n", remotePeer.ShortString())
+			if r.applyHeartbeat(remotePeer, req.ProviderInfo) {
+				log.Printf("[Reg] ❤️ Heartbeat received: %s\n", remotePeer.ShortString())
 				resp.Success = true
-
-				// Save to Redis if enabled
-				storageRecord := r.convertToStorageRecord(entry)
-				if err := r.storage.SaveRegistration(context.Background(), remotePeer, storageRecord); err != nil {
-					log.Printf("[Reg] Warning: Failed to save heartbeat to Redis: %v", err)
-				}
 			}
-			r.mu.Unlock()
 		} else {
-			// New registration or stake changed
 			if err := r.checkStakeValidity(remotePeer, req.StakeProof); err != nil {
 				resp.Error = err.Error()
-				log.Printf("[Reg] Stake Invalid: %v\n", err)
+				log.Printf("[Reg] ❌ Stake Invalid: %v\n", err)
 				break
 			}
 
-			// Replay protection: check if this stake is already used by this peer
-			key := fmt.Sprintf("%s|%d", req.StakeProof.TxHash, req.StakeProof.Nonce)
-			r.stakeMu.Lock()
-			stakes := r.peerStakes[remotePeer]
-			alreadyUsed := false
-			for _, existingKey := range stakes {
-				if existingKey == key {
-					alreadyUsed = true
+			replayKey, replayErr := r.checkAndRecordReplay(remotePeer, req.StakeProof)
+			if replayErr != nil {
+				resp.Error = replayErr.Error()
+				log.Printf("[Reg] ❌ Replay Attack: %s\n", resp.Error)
+				break
+			}
+
+			if req.StakeProof.IsEVMMode() && r.evmVerifier != nil {
+				if err := r.evmVerifier.RecordWalletBinding(req.StakeProof.WalletAddress, remotePeer.String()); err != nil {
+					resp.Error = err.Error()
+					log.Printf("[Reg] ❌ Wallet Binding Rejected: %v\n", err)
 					break
 				}
 			}
-			if alreadyUsed {
-				r.stakeMu.Unlock()
-				resp.Error = "stake proof already used (replay detected)"
-				log.Printf("[Reg] Replay Attack: %s\n", resp.Error)
-				break
-			}
-			r.peerStakes[remotePeer] = append(stakes, key)
 
-			// Persist to Redis
-			if err := r.storage.SavePeerStakes(context.Background(), remotePeer, r.peerStakes[remotePeer]); err != nil {
-				log.Printf("[Reg] Warning: Failed to save peer stakes to Redis: %v", err)
-			}
-
-			r.stakeMu.Unlock()
+			_ = replayKey
 
 			var embedding []float32
 			if r.qdrant != nil {
 				if err := r.validateEmbedding(req.Card.Embedding); err != nil {
 					resp.Error = fmt.Sprintf("invalid embedding: %v", err)
-					log.Printf("[Reg] Embedding invalid: %v\n", err)
+					log.Printf("[Reg] ❌ Embedding invalid: %v\n", err)
 					break
 				}
 				embedding = req.Card.Embedding
@@ -703,7 +966,7 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 				}
 			}
 
-			log.Printf("[Reg] New Registration: %s (Service: %s)\n", remotePeer.ShortString(), req.Card.Name)
+			log.Printf("[Reg] ✅ New Registration: %s (Service: %s)\n", remotePeer.ShortString(), req.Card.Name)
 			resp.Success = true
 
 			r.mu.Unlock()
@@ -745,86 +1008,33 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 		r.mu.Unlock()
 
 	case "unregister":
-		if req.StakeProof == nil {
-			resp.Error = "stake proof required for unregister"
-			log.Printf("[Reg] Unregister failed: no stake proof provided\n")
-			break
-		}
+		r.handleUnregister(remotePeer, &req, &resp)
 
-		// Get the stake key from the provided StakeProof
-		stakeKey := fmt.Sprintf("%s|%d", req.StakeProof.TxHash, req.StakeProof.Nonce)
+	default:
+		resp.Error = "Unknown method"
+	}
 
-		r.stakeMu.Lock()
+	_ = json.NewEncoder(rw).Encode(resp)
+	_ = rw.Flush()
+}
 
-		// Find and remove the stake from peerStakes
-		stakes, exists := r.peerStakes[remotePeer]
-		if !exists {
-			r.stakeMu.Unlock()
-			resp.Error = "no stakes found for peer"
-			log.Printf("[Reg] Unregister failed: no stakes for %s\n", remotePeer.ShortString())
-			break
-		}
+func (r *RegistryNode) handleUnregister(remotePeer peer.ID, req *common.RegistryRequest, resp *common.RegistryResponse) {
+	if req.StakeProof == nil {
+		resp.Error = "stake proof required for unregister"
+		log.Printf("[Reg] ❌ Unregister failed: no stake proof provided\n")
+		return
+	}
 
-		// Check if the stake exists and remove it from peerStakes
-		found := false
-		newStakes := make([]string, 0, len(stakes))
-		for _, existingKey := range stakes {
-			if existingKey == stakeKey {
-				found = true
-			} else {
-				newStakes = append(newStakes, existingKey)
-			}
-		}
+	// Get the stake key based on mode
+	var stakeKey string
+	if req.StakeProof.IsEVMMode() {
+		stakeKey = fmt.Sprintf("evm|%s|%d", strings.ToLower(req.StakeProof.WalletAddress), req.StakeProof.WalletNonce)
+	} else {
+		stakeKey = fmt.Sprintf("mock|%s|%d", req.StakeProof.TxHash, req.StakeProof.Nonce)
+	}
 
-		if !found {
-			r.stakeMu.Unlock()
-			resp.Error = "stake not found for this peer"
-			log.Printf("[Reg] Unregister failed: stake %s not found for %s\n", stakeKey, remotePeer.ShortString())
-			break
-		}
-
-		// Update peerStakes (or delete if no stakes left)
-		if len(newStakes) == 0 {
-			delete(r.peerStakes, remotePeer)
-			// Remove from Redis
-			if err := r.storage.DeletePeerStakes(context.Background(), remotePeer); err != nil {
-				log.Printf("[Reg] Warning: Failed to delete peer stakes from Redis: %v", err)
-			}
-		} else {
-			r.peerStakes[remotePeer] = newStakes
-			// Update in Redis
-			if err := r.storage.SavePeerStakes(context.Background(), remotePeer, newStakes); err != nil {
-				log.Printf("[Reg] Warning: Failed to save peer stakes to Redis: %v", err)
-			}
-		}
-
-		// Create frozen stake
-		now := time.Now().Unix()
-		frozen := freezedStake{
-			ID:        stakeKey,
-			PeerID:    remotePeer,
-			CreatedAt: now,
-		}
-
-		// Add to freezedPeerStakes
-		r.freezedPeerStakes[remotePeer] = append(r.freezedPeerStakes[remotePeer], frozen)
-
-		// Persist freezedPeerStakes to Redis
-		if err := r.storage.SaveFreezedPeerStakes(context.Background(), remotePeer, convertToStorageFreezedStakeSlice(r.freezedPeerStakes[remotePeer])); err != nil {
-			log.Printf("[Reg] Warning: Failed to save freezed peer stakes to Redis: %v", err)
-		}
-
-		// Add to global freezedStakes list
-		r.freezedStakes = append(r.freezedStakes, frozen)
-
-		// Persist global freezedStakes to Redis
-		if err := r.storage.SaveFreezedStakes(context.Background(), convertToStorageFreezedStakeSlice(r.freezedStakes)); err != nil {
-			log.Printf("[Reg] Warning: Failed to save global freezed stakes to Redis: %v", err)
-		}
-
-		r.stakeMu.Unlock()
-
-		// Remove service from registrations and index
+	// For EVM mode, just remove from registrations (stake is on-chain)
+	if req.StakeProof.IsEVMMode() {
 		r.mu.Lock()
 		if registration, exists := r.Registrations[remotePeer]; exists {
 			serviceName := registration.ServiceCard.Name
@@ -848,20 +1058,117 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 				}
 			}
 
-			log.Printf("[Reg] Removed service %s for peer %s\n", serviceName, remotePeer.ShortString())
+			log.Printf("[Reg] 🗑️ Removed EVM service %s for peer %s\n", serviceName, remotePeer.ShortString())
 		}
 		r.mu.Unlock()
 
 		resp.Success = true
-		log.Printf("[Reg] Unregistered stake %s for %s: frozen until %s\n",
-			stakeKey, remotePeer.ShortString(), time.Unix(now+UNFREEZE_DELAY, 0).Format(time.RFC3339))
-
-	default:
-		resp.Error = "Unknown method"
+		log.Printf("[Reg] ✅ EVM unregister complete for %s (stake managed on-chain)\n", remotePeer.ShortString())
+		return
 	}
 
-	_ = json.NewEncoder(rw).Encode(resp)
-	_ = rw.Flush()
+	// Mock mode: freeze the stake
+	r.stakeMu.Lock()
+
+	// Find and remove the stake from peerStakes
+	stakes, exists := r.peerStakes[remotePeer]
+	if !exists {
+		r.stakeMu.Unlock()
+		resp.Error = "no stakes found for peer"
+		log.Printf("[Reg] ❌ Unregister failed: no stakes for %s\n", remotePeer.ShortString())
+		return
+	}
+
+	// Check if the stake exists and remove it from peerStakes
+	found := false
+	newStakes := make([]string, 0, len(stakes))
+	for _, existingKey := range stakes {
+		if existingKey == stakeKey {
+			found = true
+		} else {
+			newStakes = append(newStakes, existingKey)
+		}
+	}
+
+	if !found {
+		r.stakeMu.Unlock()
+		resp.Error = "stake not found for this peer"
+		log.Printf("[Reg] ❌ Unregister failed: stake %s not found for %s\n", stakeKey, remotePeer.ShortString())
+		return
+	}
+
+	// Update peerStakes (or delete if no stakes left)
+	if len(newStakes) == 0 {
+		delete(r.peerStakes, remotePeer)
+		// Remove from Redis
+		if err := r.storage.DeletePeerStakes(context.Background(), remotePeer); err != nil {
+			log.Printf("[Reg] Warning: Failed to delete peer stakes from Redis: %v", err)
+		}
+	} else {
+		r.peerStakes[remotePeer] = newStakes
+		// Update in Redis
+		if err := r.storage.SavePeerStakes(context.Background(), remotePeer, newStakes); err != nil {
+			log.Printf("[Reg] Warning: Failed to save peer stakes to Redis: %v", err)
+		}
+	}
+
+	// Create frozen stake
+	now := time.Now().Unix()
+	frozen := freezedStake{
+		ID:        stakeKey,
+		PeerID:    remotePeer,
+		CreatedAt: now,
+	}
+
+	// Add to freezedPeerStakes
+	r.freezedPeerStakes[remotePeer] = append(r.freezedPeerStakes[remotePeer], frozen)
+
+	// Persist freezedPeerStakes to Redis
+	if err := r.storage.SaveFreezedPeerStakes(context.Background(), remotePeer, convertToStorageFreezedStakeSlice(r.freezedPeerStakes[remotePeer])); err != nil {
+		log.Printf("[Reg] Warning: Failed to save freezed peer stakes to Redis: %v", err)
+	}
+
+	// Add to global freezedStakes list
+	r.freezedStakes = append(r.freezedStakes, frozen)
+
+	// Persist global freezedStakes to Redis
+	if err := r.storage.SaveFreezedStakes(context.Background(), convertToStorageFreezedStakeSlice(r.freezedStakes)); err != nil {
+		log.Printf("[Reg] Warning: Failed to save global freezed stakes to Redis: %v", err)
+	}
+
+	r.stakeMu.Unlock()
+
+	// Remove service from registrations and index
+	r.mu.Lock()
+	if registration, exists := r.Registrations[remotePeer]; exists {
+		serviceName := registration.ServiceCard.Name
+
+		// Remove from the service index
+		r.removeFromIndex(remotePeer, serviceName)
+
+		// Remove from registrations
+		delete(r.Registrations, remotePeer)
+
+		// Remove from Redis storage
+		if err := r.storage.DeleteRegistration(context.Background(), remotePeer, serviceName); err != nil {
+			log.Printf("[Reg] Warning: Failed to delete registration from Redis: %v", err)
+		}
+
+		// Remove from Qdrant if enabled
+		if r.qdrant != nil {
+			pointID := fmt.Sprintf("%s:%s", remotePeer.String(), serviceName)
+			if err := r.qdrant.RemoveService(pointID); err != nil {
+				log.Printf("[Reg] Warning: Qdrant remove error: %v\n", err)
+			}
+		}
+
+		log.Printf("[Reg] 🗑️ Removed service %s for peer %s\n", serviceName, remotePeer.ShortString())
+	}
+	r.mu.Unlock()
+
+	resp.Success = true
+	log.Printf("[Reg] 🧊 Unregistered stake %s for %s: frozen until %s\n",
+		stakeKey, remotePeer.ShortString(), time.Unix(now+UNFREEZE_DELAY, 0).Format(time.RFC3339))
 }
 
 // setupRESTAPI configures the Gin router with read-only endpoints for Services
@@ -899,6 +1206,21 @@ func (r *RegistryNode) setupRESTAPI() *gin.Engine {
 
 		// GET registry info (Peer ID and multiaddr)
 		api.GET("/registry/info", r.getRegistryInfo)
+
+		// Credits API (Agent-to-Agent payments)
+		api.GET("/credits/:peerId", r.getBalance)
+		api.POST("/credits/deposit", r.depositCredits)
+		api.POST("/credits/charge", r.chargeCredits)
+		api.GET("/credits/:peerId/history", r.getTransactionHistory)
+
+		// Settlement API (Withdraw credits to blockchain)
+		api.POST("/credits/withdraw", r.requestWithdrawal)
+		api.GET("/credits/withdraw/:requestId", r.getWithdrawal)
+		api.GET("/credits/withdrawals/:peerId", r.getWithdrawalHistory)
+
+		// Blockchain Deposit API (ETH -> credits)
+		api.GET("/deposit/info", r.getDepositInfo)
+		api.GET("/deposit/history/:peerId", r.getDepositHistory)
 	}
 
 	return router
@@ -1137,6 +1459,581 @@ func (r *RegistryNode) getRegistryInfo(c *gin.Context) {
 		"multiaddrs": addrs,
 		"bootstrap":  bootstrapAddr,
 	})
+}
+
+// --- Credits API (Agent-to-Agent payments) ---
+
+// getBalance returns the credit balance for a peer
+// GET /api/v1/credits/:peerId
+func (r *RegistryNode) getBalance(c *gin.Context) {
+	peerID := c.Param("peerId")
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerId is required"})
+		return
+	}
+
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "credits system requires Redis storage"})
+		return
+	}
+
+	account, err := r.storage.GetBalance(c.Request.Context(), peerID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, account)
+}
+
+// depositCredits adds credits to a peer's balance
+// POST /api/v1/credits/deposit
+func (r *RegistryNode) depositCredits(c *gin.Context) {
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "credits system requires Redis storage"})
+		return
+	}
+
+	var req common.CreditDepositRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if req.PeerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peer_id is required"})
+		return
+	}
+
+	if req.Amount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be positive"})
+		return
+	}
+
+	account, err := r.storage.AddBalance(c.Request.Context(), req.PeerID, req.Amount)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[Reg] Deposited %.4f credits to %s", req.Amount, req.PeerID[:12])
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"account": account,
+	})
+}
+
+// chargeCredits transfers credits from one peer to another
+// POST /api/v1/credits/charge
+func (r *RegistryNode) chargeCredits(c *gin.Context) {
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "credits system requires Redis storage"})
+		return
+	}
+
+	var req common.CreditChargeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	if req.FromPeer == "" || req.ToPeer == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "from_peer and to_peer are required"})
+		return
+	}
+
+	if req.Amount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "amount must be positive"})
+		return
+	}
+
+	tx, err := r.storage.ChargeBalance(c.Request.Context(), req.FromPeer, req.ToPeer, req.Amount, req.Service)
+	if err != nil {
+		// Check if insufficient balance
+		if strings.Contains(err.Error(), "insufficient balance") {
+			c.JSON(http.StatusPaymentRequired, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[Reg] Charged %.4f credits: %s -> %s for %s", req.Amount, req.FromPeer[:12], req.ToPeer[:12], req.Service)
+	c.JSON(http.StatusOK, gin.H{
+		"success":     true,
+		"transaction": tx,
+	})
+}
+
+// getTransactionHistory returns the transaction history for a peer
+// GET /api/v1/credits/:peerId/history
+func (r *RegistryNode) getTransactionHistory(c *gin.Context) {
+	peerID := c.Param("peerId")
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerId is required"})
+		return
+	}
+
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "credits system requires Redis storage"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 50
+	}
+
+	transactions, err := r.storage.GetTransactions(c.Request.Context(), peerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"peer_id":      peerID,
+		"transactions": transactions,
+		"count":        len(transactions),
+	})
+}
+
+// --- Settlement (Withdraw credits to blockchain) ---
+
+// requestWithdrawal handles POST /api/v1/credits/withdraw
+func (r *RegistryNode) requestWithdrawal(c *gin.Context) {
+	if !r.settlementEnabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "settlement not enabled"})
+		return
+	}
+
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "settlement requires Redis storage"})
+		return
+	}
+
+	var req common.WithdrawRequest
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request: " + err.Error()})
+		return
+	}
+
+	// Validate request
+	if req.PeerID == "" || req.Amount <= 0 || req.WalletAddress == "" || req.Chain == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peer_id, amount, wallet_address, and chain are required"})
+		return
+	}
+
+	// Check chain
+	if req.Chain != r.settlementChain {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("unsupported chain: %s (only %s supported)", req.Chain, r.settlementChain)})
+		return
+	}
+
+	// Validate wallet address
+	if !ethcommon.IsHexAddress(req.WalletAddress) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid wallet address"})
+		return
+	}
+
+	// Check minimum amount
+	if req.Amount < r.settlementMinAmount {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("amount below minimum: %.2f (minimum: %.2f)", req.Amount, r.settlementMinAmount),
+		})
+		return
+	}
+
+	// Check balance
+	account, err := r.storage.GetBalance(c.Request.Context(), req.PeerID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "account not found"})
+		return
+	}
+
+	if account.Balance < req.Amount {
+		c.JSON(http.StatusPaymentRequired, gin.H{
+			"error": fmt.Sprintf("insufficient balance: have %.2f, need %.2f", account.Balance, req.Amount),
+		})
+		return
+	}
+
+	// Convert credits to wei
+	ethAmount := req.Amount * r.settlementRate
+	weiAmount := new(big.Float).Mul(big.NewFloat(ethAmount), big.NewFloat(1e18))
+	weiInt, _ := weiAmount.Int(nil)
+	amountWei := weiInt.String()
+
+	// Create withdrawal request
+	wdr, err := r.storage.CreateWithdrawal(
+		c.Request.Context(),
+		req.PeerID,
+		req.Amount,
+		req.WalletAddress,
+		req.Chain,
+		amountWei,
+	)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create withdrawal: " + err.Error()})
+		return
+	}
+
+	log.Printf("[Settlement] Created withdrawal request %s: %.2f credits -> %.8f ETH (peer: %s, wallet: %s)",
+		wdr.ID, wdr.Amount, ethAmount, req.PeerID[:12], req.WalletAddress)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"request": wdr,
+	})
+}
+
+// getWithdrawal handles GET /api/v1/credits/withdraw/:requestId
+func (r *RegistryNode) getWithdrawal(c *gin.Context) {
+	if !r.settlementEnabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "settlement not enabled"})
+		return
+	}
+
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "settlement requires Redis storage"})
+		return
+	}
+
+	requestID := c.Param("requestId")
+	if requestID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "requestId is required"})
+		return
+	}
+
+	wdr, err := r.storage.GetWithdrawal(c.Request.Context(), requestID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "withdrawal not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, wdr)
+}
+
+// getWithdrawalHistory handles GET /api/v1/credits/withdrawals/:peerId
+func (r *RegistryNode) getWithdrawalHistory(c *gin.Context) {
+	if !r.settlementEnabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "settlement not enabled"})
+		return
+	}
+
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "settlement requires Redis storage"})
+		return
+	}
+
+	peerID := c.Param("peerId")
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerId is required"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 50
+	}
+
+	withdrawals, err := r.storage.GetWithdrawals(c.Request.Context(), peerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Calculate total withdrawn
+	totalWithdrawn := 0.0
+	for _, w := range withdrawals {
+		if w.Status == "completed" {
+			totalWithdrawn += w.Amount
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"peer_id":         peerID,
+		"withdrawals":     withdrawals,
+		"count":           len(withdrawals),
+		"total_withdrawn": totalWithdrawn,
+	})
+}
+
+// withdrawalProcessor processes pending withdrawal requests in background
+func (r *RegistryNode) withdrawalProcessor() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("[Settlement] Withdrawal processor started")
+
+	for range ticker.C {
+		r.processPendingWithdrawals()
+	}
+}
+
+// processPendingWithdrawals processes all pending withdrawals
+func (r *RegistryNode) processPendingWithdrawals() {
+	ctx := context.Background()
+
+	pending, err := r.storage.GetPendingWithdrawals(ctx)
+	if err != nil {
+		log.Printf("[Settlement] Error getting pending withdrawals: %v", err)
+		return
+	}
+
+	if len(pending) == 0 {
+		return
+	}
+
+	log.Printf("[Settlement] Processing %d pending withdrawals", len(pending))
+
+	for _, wdr := range pending {
+		if err := r.processWithdrawal(ctx, &wdr); err != nil {
+			log.Printf("[Settlement] Error processing withdrawal %s: %v", wdr.ID, err)
+		}
+	}
+}
+
+// processWithdrawal processes a single withdrawal request
+func (r *RegistryNode) processWithdrawal(ctx context.Context, wdr *common.WithdrawalRequest) error {
+	// Check balance again (might have changed)
+	account, err := r.storage.GetBalance(ctx, wdr.PeerID)
+	if err != nil || account.Balance < wdr.Amount {
+		errMsg := "insufficient balance"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		r.storage.UpdateWithdrawalStatus(ctx, wdr.ID, "failed", "", errMsg)
+		return fmt.Errorf("%s", errMsg)
+	}
+
+	// Update status to processing
+	if err := r.storage.UpdateWithdrawalStatus(ctx, wdr.ID, "processing", "", ""); err != nil {
+		return err
+	}
+
+	log.Printf("[Settlement] Processing withdrawal %s: %.2f credits -> %s ETH to %s",
+		wdr.ID, wdr.Amount, wdr.AmountWei, wdr.WalletAddress)
+
+	// Send ETH transaction
+	txHash, err := r.ethClient.SendETH(wdr.WalletAddress, wdr.AmountWei)
+	if err != nil {
+		r.storage.UpdateWithdrawalStatus(ctx, wdr.ID, "failed", "", err.Error())
+		return fmt.Errorf("failed to send ETH: %w", err)
+	}
+
+	log.Printf("[Settlement] Transaction sent: %s (withdrawal: %s)", txHash, wdr.ID)
+
+	// Update with tx hash
+	if err := r.storage.UpdateWithdrawalStatus(ctx, wdr.ID, "processing", txHash, ""); err != nil {
+		return err
+	}
+
+	// Wait for confirmation
+	if err := r.ethClient.WaitForConfirmation(txHash, r.settlementConfirms); err != nil {
+		r.storage.UpdateWithdrawalStatus(ctx, wdr.ID, "failed", txHash, err.Error())
+		return fmt.Errorf("transaction failed: %w", err)
+	}
+
+	log.Printf("[Settlement] Transaction confirmed: %s (%d confirmations)", txHash, r.settlementConfirms)
+
+	// Deduct balance
+	newBalance := account.Balance - wdr.Amount
+	if err := r.storage.SetBalance(ctx, wdr.PeerID, newBalance); err != nil {
+		log.Printf("[Settlement] WARNING: Transaction sent but failed to update balance: %v", err)
+		// Don't fail - transaction already confirmed
+	}
+
+	// Mark as completed
+	if err := r.storage.UpdateWithdrawalStatus(ctx, wdr.ID, "completed", txHash, ""); err != nil {
+		return err
+	}
+
+	log.Printf("[Settlement] ✅ Withdrawal completed: %s (%.2f credits withdrawn, new balance: %.2f)",
+		wdr.ID, wdr.Amount, newBalance)
+
+	return nil
+}
+
+// --- Blockchain Deposit (ETH -> credits) ---
+
+// getDepositInfo returns information for depositing ETH
+// GET /api/v1/deposit/info
+func (r *RegistryNode) getDepositInfo(c *gin.Context) {
+	if !r.depositEnabled || r.depositContract == "" {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "blockchain deposits not enabled"})
+		return
+	}
+
+	// Calculate min deposit in ETH and wei
+	minCredits := 1.0 // 1 credit minimum
+	minETH := minCredits * r.settlementRate
+	minWei := new(big.Float).Mul(big.NewFloat(minETH), big.NewFloat(1e18))
+	minWeiInt, _ := minWei.Int(nil)
+
+	info := common.DepositInfo{
+		ContractAddress: r.depositContract,
+		Chain:           r.settlementChain,
+		Rate:            r.settlementRate,
+		MinDeposit:      fmt.Sprintf("%.6f ETH", minETH),
+		MinDepositWei:   minWeiInt.String(),
+		Instructions:    fmt.Sprintf("Call deposit(peerId) on contract %s with ETH. Rate: %.6f ETH = 1 credit", r.depositContract, r.settlementRate),
+	}
+
+	c.JSON(http.StatusOK, info)
+}
+
+// getDepositHistory returns deposit history for a peer
+// GET /api/v1/deposit/history/:peerId
+func (r *RegistryNode) getDepositHistory(c *gin.Context) {
+	if !r.depositEnabled {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "blockchain deposits not enabled"})
+		return
+	}
+
+	if r.storage == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "deposits require Redis storage"})
+		return
+	}
+
+	peerID := c.Param("peerId")
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerId is required"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "50")
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 50
+	}
+
+	deposits, err := r.storage.GetDeposits(c.Request.Context(), peerID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Calculate total deposited
+	totalDeposited := 0.0
+	for _, d := range deposits {
+		totalDeposited += d.AmountCredits
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"peer_id":         peerID,
+		"deposits":        deposits,
+		"count":           len(deposits),
+		"total_deposited": totalDeposited,
+	})
+}
+
+// depositWatcher monitors the deposit contract for new deposits
+func (r *RegistryNode) depositWatcher() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	log.Println("[Deposit] Watcher started")
+
+	// Get initial block
+	ctx := context.Background()
+	lastBlock, err := r.storage.GetLastProcessedBlock(ctx)
+	if err != nil {
+		log.Printf("[Deposit] Warning: Failed to get last processed block: %v", err)
+	}
+
+	if lastBlock == 0 {
+		// Start from current block - 100 (to catch recent deposits)
+		currentBlock, err := r.ethClient.GetCurrentBlock(ctx)
+		if err != nil {
+			log.Printf("[Deposit] Warning: Failed to get current block: %v", err)
+			lastBlock = 0
+		} else if currentBlock > 100 {
+			lastBlock = currentBlock - 100
+		}
+	}
+
+	log.Printf("[Deposit] Starting from block %d", lastBlock)
+
+	for range ticker.C {
+		r.processDeposits(lastBlock, &lastBlock)
+	}
+}
+
+// processDeposits fetches and processes new deposit events
+func (r *RegistryNode) processDeposits(fromBlock uint64, lastBlock *uint64) {
+	ctx := context.Background()
+
+	// Get current block
+	currentBlock, err := r.ethClient.GetCurrentBlock(ctx)
+	if err != nil {
+		log.Printf("[Deposit] Error getting current block: %v", err)
+		return
+	}
+
+	// Don't process if no new blocks
+	if currentBlock <= *lastBlock {
+		return
+	}
+
+	// Process in chunks of 1000 blocks
+	toBlock := *lastBlock + 1000
+	if toBlock > currentBlock {
+		toBlock = currentBlock
+	}
+
+	// Fetch deposit events
+	events, err := r.ethClient.GetDepositEvents(ctx, r.depositContract, *lastBlock+1, toBlock)
+	if err != nil {
+		log.Printf("[Deposit] Error fetching events: %v", err)
+		return
+	}
+
+	// Process each deposit
+	for _, event := range events {
+		// Check if already processed
+		processed, err := r.storage.IsDepositProcessed(ctx, event.TxHash)
+		if err != nil {
+			log.Printf("[Deposit] Error checking tx %s: %v", event.TxHash, err)
+			continue
+		}
+		if processed {
+			continue
+		}
+
+		// Calculate credits: amountWei / (rate * 1e18)
+		amountWeiFloat := new(big.Float).SetInt(event.AmountWei)
+		rateWei := new(big.Float).Mul(big.NewFloat(r.settlementRate), big.NewFloat(1e18))
+		creditsFloat := new(big.Float).Quo(amountWeiFloat, rateWei)
+		credits, _ := creditsFloat.Float64()
+
+		// Record deposit
+		deposit, err := r.storage.RecordDeposit(
+			ctx,
+			event.TxHash,
+			event.FromAddress,
+			event.PeerID,
+			event.AmountWei.String(),
+			credits,
+			event.BlockNumber,
+		)
+		if err != nil {
+			log.Printf("[Deposit] Error recording deposit: %v", err)
+			continue
+		}
+
+		log.Printf("[Deposit] Processed: %s -> %.2f credits for %s (tx: %s)",
+			event.FromAddress[:12], credits, event.PeerID[:12], event.TxHash[:12])
+
+		_ = deposit // silence unused warning
+	}
+
+	// Update last processed block
+	*lastBlock = toBlock
+	if err := r.storage.SetLastProcessedBlock(ctx, toBlock); err != nil {
+		log.Printf("[Deposit] Warning: Failed to save last processed block: %v", err)
+	}
 }
 
 // --- Embedding client (OpenAI-compatible) ---

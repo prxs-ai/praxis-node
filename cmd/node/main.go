@@ -13,9 +13,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
+	ethaccounts "github.com/ethereum/go-ethereum/accounts"
+	ethcommon "github.com/ethereum/go-ethereum/common"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
@@ -33,11 +37,13 @@ func init() {
 // --- Agent Management ---
 
 type ProviderDaemon struct {
-	agentCmd     *exec.Cmd
-	agentEncoder *json.Encoder
-	agentDecoder *json.Decoder
-	mu           sync.Mutex
-	Card         common.ServiceCard
+	agentCmd       *exec.Cmd
+	agentEncoder   *json.Encoder
+	agentDecoder   *json.Decoder
+	mu             sync.Mutex
+	Card           common.ServiceCard
+	registryAPIURL string // Registry REST API URL for credits
+	myPeerID       string // This provider's peer ID
 }
 
 func buildStakeProof(priv crypto.PrivKey, amount float64, chainID string) (*common.StakeProof, error) {
@@ -152,16 +158,16 @@ func runStakingHelper(ctx context.Context, proofPath string, amount float64, cha
 				return
 			}
 			b, _ := json.MarshalIndent(proof, "", "  ")
-	if err := os.WriteFile(proofPath, b, 0600); err != nil {
-		http.Error(w, "failed to save stake proof", http.StatusInternalServerError)
-		return
-	}
-	select {
-	case proofCh <- proof:
-	default:
-	}
-	fmt.Fprintf(w, "<p>Stake proof saved. You can close this tab.</p>")
-	go srv.Shutdown(context.Background())
+			if err := os.WriteFile(proofPath, b, 0600); err != nil {
+				http.Error(w, "failed to save stake proof", http.StatusInternalServerError)
+				return
+			}
+			select {
+			case proofCh <- proof:
+			default:
+			}
+			fmt.Fprintf(w, "<p>Stake proof saved. You can close this tab.</p>")
+			go srv.Shutdown(context.Background())
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -187,6 +193,266 @@ func runStakingHelper(ctx context.Context, proofPath string, amount float64, cha
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func loadOrCreateEVMStakeProof(ctx context.Context, proofPath string, peerID string, evmChainID int64, stakingContract string, webPort int) (*common.StakeProof, error) {
+	data, err := os.ReadFile(proofPath)
+	if err == nil {
+		var proof common.StakeProof
+		if err := json.Unmarshal(data, &proof); err == nil && proof.IsEVMMode() {
+			contractMatch := strings.EqualFold(proof.StakingContract, stakingContract)
+			if proof.Staker == peerID && proof.EvmChainID == evmChainID && contractMatch {
+				return &proof, nil
+			}
+		}
+	}
+
+	return runEVMStakingHelper(ctx, proofPath, peerID, evmChainID, stakingContract, webPort)
+}
+
+func buildEVMStakeProof(peerID string, evmChainID int64, stakingContract string, walletAddress string, walletSignature string, walletNonce int64, walletIssuedAt int64, walletExpiresAt int64) (*common.StakeProof, error) {
+	sigBytes, err := hexToBytes(walletSignature)
+	if err != nil {
+		return nil, err
+	}
+
+	return &common.StakeProof{
+		Mode:            common.StakeProofModeEVM,
+		Staker:          peerID,
+		WalletAddress:   walletAddress,
+		WalletSignature: sigBytes,
+		WalletNonce:     walletNonce,
+		WalletIssuedAt:  walletIssuedAt,
+		WalletExpiresAt: walletExpiresAt,
+		EvmChainID:      evmChainID,
+		StakingContract: stakingContract,
+	}, nil
+}
+
+func verifyWalletBindingSignature(walletAddr string, signature []byte, message string) error {
+	if len(signature) != 65 {
+		return fmt.Errorf("invalid signature length: expected 65, got %d", len(signature))
+	}
+
+	messageHash := ethaccounts.TextHash([]byte(message))
+
+	sig := make([]byte, 65)
+	copy(sig, signature)
+	if sig[64] >= 27 {
+		sig[64] -= 27
+	}
+
+	pubKey, err := ethcrypto.SigToPub(messageHash, sig)
+	if err != nil {
+		return fmt.Errorf("failed to recover public key: %w", err)
+	}
+
+	recoveredAddr := ethcrypto.PubkeyToAddress(*pubKey)
+	expectedAddr := ethcommon.HexToAddress(walletAddr)
+	if recoveredAddr != expectedAddr {
+		return fmt.Errorf("wallet signature does not match address")
+	}
+
+	return nil
+}
+
+func runEVMStakingHelper(ctx context.Context, proofPath string, peerID string, evmChainID int64, stakingContract string, webPort int) (*common.StakeProof, error) {
+	fmt.Printf("[Prov] EVM Wallet binding required. Visit http://127.0.0.1:%d/stake to connect wallet\n", webPort)
+
+	tmpl := template.Must(template.New("evmstake").Parse(`
+<!doctype html>
+<html>
+<head><title>PRXS EVM Wallet Binding</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/5.7.2/ethers.umd.min.js"></script>
+</head>
+<body style="font-family: sans-serif; max-width: 600px; margin: 2rem auto;">
+  <h2>Connect Wallet to Bind Peer ID</h2>
+  <p><strong>Peer ID:</strong> <code style="font-size:0.8em;">{{.PeerID}}</code></p>
+  <p><strong>Chain ID:</strong> {{.ChainID}}</p>
+  <p><strong>Contract:</strong> <code style="font-size:0.8em;">{{.Contract}}</code></p>
+  
+  <div id="status" style="margin: 20px 0; padding: 10px; background: #f0f0f0; border-radius: 8px;">
+    <p>Click below to connect your wallet and sign a message binding your wallet to this peer ID.</p>
+  </div>
+  
+  <button id="connectBtn" style="padding:12px 24px;border:none;border-radius:8px;background:#2563eb;color:white;font-size:16px;cursor:pointer;">
+    Connect Wallet & Sign
+  </button>
+  
+  <script>
+    const peerID = "{{.PeerID}}";
+    const chainID = {{.ChainID}};
+    const contract = "{{.Contract}}";
+    const messageTemplate = "PRXS Peer Binding\nPeer ID: {{"{{peer_id}}"}}\nChain ID: {{"{{chain_id}}"}}\nContract: {{"{{contract}}"}}\nNonce: {{"{{nonce}}"}}\nIssued: {{"{{issued}}"}}\nExpires: {{"{{expires}}"}}";
+    
+    document.getElementById('connectBtn').onclick = async () => {
+      const status = document.getElementById('status');
+      try {
+        if (!window.ethereum) {
+          status.innerHTML = '<p style="color:red;">MetaMask not detected. Please install MetaMask.</p>';
+          return;
+        }
+        
+        status.innerHTML = '<p>Connecting wallet...</p>';
+        const provider = new ethers.providers.Web3Provider(window.ethereum);
+        await provider.send("eth_requestAccounts", []);
+        const signer = provider.getSigner();
+        const walletAddress = await signer.getAddress();
+        
+        const nonce = Date.now();
+        const issuedAt = Math.floor(Date.now() / 1000);
+        const expiresAt = 0;
+        const expiresValue = expiresAt > 0 ? String(expiresAt) : "never";
+        const message = messageTemplate
+          .replaceAll("{{"{{peer_id}}"}}", peerID)
+          .replaceAll("{{"{{chain_id}}"}}", String(chainID))
+          .replaceAll("{{"{{contract}}"}}", contract)
+          .replaceAll("{{"{{nonce}}"}}", String(nonce))
+          .replaceAll("{{"{{issued}}"}}", String(issuedAt))
+          .replaceAll("{{"{{expires}}"}}", expiresValue);
+        
+        status.innerHTML = '<p>Please sign the message in your wallet...</p>';
+        const signature = await signer.signMessage(message);
+        
+        status.innerHTML = '<p>Submitting binding proof...</p>';
+        const resp = await fetch('/stake', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            wallet_address: walletAddress,
+            wallet_signature: signature,
+            wallet_nonce: nonce,
+            wallet_issued_at: issuedAt,
+            wallet_expires_at: expiresAt
+          })
+        });
+        
+        if (resp.ok) {
+          status.innerHTML = '<p style="color:green;">✅ Wallet binding saved! You can close this tab.</p>';
+          document.getElementById('connectBtn').disabled = true;
+        } else {
+          const err = await resp.text();
+          status.innerHTML = '<p style="color:red;">Error: ' + err + '</p>';
+        }
+      } catch (e) {
+        status.innerHTML = '<p style="color:red;">Error: ' + e.message + '</p>';
+      }
+    };
+  </script>
+</body>
+</html>
+`))
+
+	type pageData struct {
+		PeerID          string
+		ChainID         int64
+		Contract        string
+		MessageTemplate string
+	}
+
+	proofCh := make(chan *common.StakeProof, 1)
+	srv := &http.Server{Addr: fmt.Sprintf(":%d", webPort)}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stake", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			_ = tmpl.Execute(w, pageData{
+				PeerID:          peerID,
+				ChainID:         evmChainID,
+				Contract:        stakingContract,
+				MessageTemplate: common.WalletBindingMessageTemplate,
+			})
+		case http.MethodPost:
+			var req struct {
+				WalletAddress   string `json:"wallet_address"`
+				WalletSignature string `json:"wallet_signature"`
+				WalletNonce     int64  `json:"wallet_nonce"`
+				WalletIssuedAt  int64  `json:"wallet_issued_at"`
+				WalletExpiresAt int64  `json:"wallet_expires_at"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "invalid request", http.StatusBadRequest)
+				return
+			}
+
+			proof, err := buildEVMStakeProof(
+				peerID,
+				evmChainID,
+				stakingContract,
+				req.WalletAddress,
+				req.WalletSignature,
+				req.WalletNonce,
+				req.WalletIssuedAt,
+				req.WalletExpiresAt,
+			)
+			if err != nil {
+				http.Error(w, "invalid signature format", http.StatusBadRequest)
+				return
+			}
+
+			message := proof.GetWalletBindingMessage()
+			if err := verifyWalletBindingSignature(req.WalletAddress, proof.WalletSignature, message); err != nil {
+				http.Error(w, "invalid wallet signature", http.StatusBadRequest)
+				return
+			}
+
+			b, _ := json.MarshalIndent(proof, "", "  ")
+			if err := os.WriteFile(proofPath, b, 0600); err != nil {
+				http.Error(w, "failed to save proof", http.StatusInternalServerError)
+				return
+			}
+
+			select {
+			case proofCh <- proof:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+			go srv.Shutdown(context.Background())
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	srv.Handler = mux
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Printf("[Prov] EVM staking helper server error: %v\n", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Shutdown(context.Background())
+	}()
+
+	openBrowser(fmt.Sprintf("http://127.0.0.1:%d/stake", webPort))
+
+	select {
+	case proof := <-proofCh:
+		return proof, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func hexToBytes(hexStr string) ([]byte, error) {
+	if len(hexStr) >= 2 && hexStr[:2] == "0x" {
+		hexStr = hexStr[2:]
+	}
+	if len(hexStr)%2 != 0 {
+		hexStr = "0" + hexStr
+	}
+	result := make([]byte, len(hexStr)/2)
+	for i := 0; i < len(result); i++ {
+		var b byte
+		_, err := fmt.Sscanf(hexStr[i*2:i*2+2], "%02x", &b)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = b
+	}
+	return result, nil
 }
 
 func NewProviderDaemon(agentPath string) (*ProviderDaemon, error) {
@@ -249,26 +515,121 @@ func NewProviderDaemon(agentPath string) (*ProviderDaemon, error) {
 func (pd *ProviderDaemon) HandleExecutionStream(stream network.Stream) {
 	defer stream.Close()
 	rw := bufio.NewReadWriter(bufio.NewReader(stream), bufio.NewWriter(stream))
+
+	// Get client peer ID from stream
+	clientPeerID := stream.Conn().RemotePeer().String()
+
 	var req common.JSONRPCRequest
 	if err := json.NewDecoder(rw).Decode(&req); err != nil {
 		return
 	}
 
-	fmt.Printf("[Daemon] Executing %s...\n", req.Method)
+	fmt.Printf("[Daemon] Executing %s for client %s...\n", req.Method, clientPeerID[:12])
 
+	// Check credits if registry API is configured and cost > 0
+	if pd.registryAPIURL != "" && pd.Card.CostPerOp > 0 {
+		balance, err := pd.checkClientBalance(clientPeerID)
+		if err != nil {
+			log.Printf("[Daemon] Failed to check balance for %s: %v", clientPeerID[:12], err)
+			resp := common.JSONRPCResponse{
+				Error: fmt.Sprintf("failed to verify credits: %v", err),
+				ID:    req.ID,
+			}
+			json.NewEncoder(rw).Encode(resp)
+			rw.Flush()
+			return
+		}
+
+		if balance < pd.Card.CostPerOp {
+			log.Printf("[Daemon] Insufficient credits for %s: have %.4f, need %.4f", clientPeerID[:12], balance, pd.Card.CostPerOp)
+			resp := common.JSONRPCResponse{
+				Error: fmt.Sprintf("insufficient credits: have %.4f, need %.4f", balance, pd.Card.CostPerOp),
+				ID:    req.ID,
+			}
+			json.NewEncoder(rw).Encode(resp)
+			rw.Flush()
+			return
+		}
+	}
+
+	// Execute the request
 	pd.mu.Lock()
 	pd.agentEncoder.Encode(req)
 	var resp common.JSONRPCResponse
 	pd.agentDecoder.Decode(&resp)
 	pd.mu.Unlock()
 
+	// Charge credits after successful execution
+	if pd.registryAPIURL != "" && pd.Card.CostPerOp > 0 && resp.Error == "" {
+		if err := pd.chargeClient(clientPeerID, pd.Card.CostPerOp, pd.Card.Name); err != nil {
+			log.Printf("[Daemon] Warning: failed to charge client %s: %v", clientPeerID[:12], err)
+		} else {
+			log.Printf("[Daemon] Charged %.4f credits from %s for %s", pd.Card.CostPerOp, clientPeerID[:12], pd.Card.Name)
+		}
+	}
+
 	json.NewEncoder(rw).Encode(resp)
 	rw.Flush()
 }
 
+// checkClientBalance queries the Registry REST API for the client's credit balance
+func (pd *ProviderDaemon) checkClientBalance(clientPeerID string) (float64, error) {
+	url := fmt.Sprintf("%s/api/v1/credits/%s", pd.registryAPIURL, clientPeerID)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query balance: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("balance query failed: status %d", resp.StatusCode)
+	}
+
+	var account common.CreditAccount
+	if err := json.NewDecoder(resp.Body).Decode(&account); err != nil {
+		return 0, fmt.Errorf("failed to decode balance: %v", err)
+	}
+
+	return account.Balance, nil
+}
+
+// chargeClient requests the Registry to transfer credits from client to provider
+func (pd *ProviderDaemon) chargeClient(clientPeerID string, amount float64, service string) error {
+	url := fmt.Sprintf("%s/api/v1/credits/charge", pd.registryAPIURL)
+
+	chargeReq := common.CreditChargeRequest{
+		FromPeer: clientPeerID,
+		ToPeer:   pd.myPeerID,
+		Amount:   amount,
+		Service:  service,
+	}
+
+	body, err := json.Marshal(chargeReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal charge request: %v", err)
+	}
+
+	resp, err := http.Post(url, "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		return fmt.Errorf("failed to send charge request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&errResp)
+		return fmt.Errorf("charge failed: %s", errResp.Error)
+	}
+
+	return nil
+}
+
 // --- Provider Logic ---
 
-func startProvider(port int, agentPath string, bootstrapAddr string, devMode bool, stakeAmount float64, stakeChain string, stakeProofPath string, stakeWebPort int, stakeAddress string, privKey crypto.PrivKey) {
+func startProvider(port int, agentPath string, bootstrapAddr string, devMode bool, stakeAmount float64, stakeChain string, stakeProofPath string, stakeWebPort int, stakeAddress string, privKey crypto.PrivKey, stakeMode string, evmChainID int64, stakingContract string, registryAPI string) {
 	ctx := context.Background()
 
 	h, err := libp2p.New(common.CommonLibp2pOptions(port, privKey)...)
@@ -283,19 +644,38 @@ func startProvider(port int, agentPath string, bootstrapAddr string, devMode boo
 	}
 	defer daemon.agentCmd.Process.Kill()
 
-	// Ensure stake proof exists (load or guide user)
-	stakeProof, err := loadStakeProofFromFile(stakeProofPath, privKey, stakeChain)
-	if err != nil {
-		log.Fatalf("Failed to load stake proof: %v", err)
+	// Set up credits system
+	daemon.myPeerID = h.ID().String()
+	if registryAPI != "" {
+		daemon.registryAPIURL = strings.TrimRight(registryAPI, "/")
+		log.Printf("[Prov] Credits enabled: registry API at %s", daemon.registryAPIURL)
 	}
-	if stakeProof == nil {
-		stakeProof, err = runStakingHelper(ctx, stakeProofPath, stakeAmount, stakeChain, stakeAddress, stakeWebPort, privKey)
-		if err != nil {
-			log.Fatalf("Staking helper failed: %v", err)
+
+	var stakeProof *common.StakeProof
+
+	if stakeMode == "evm" {
+		if stakingContract == "" {
+			log.Fatal("[Prov] EVM mode requires -staking-contract flag")
 		}
-		fmt.Printf("[Prov] Stake proof saved to %s\n", stakeProofPath)
+		stakeProof, err = loadOrCreateEVMStakeProof(ctx, stakeProofPath, h.ID().String(), evmChainID, stakingContract, stakeWebPort)
+		if err != nil {
+			log.Fatalf("Failed to load/create EVM stake proof: %v", err)
+		}
+		fmt.Printf("[Prov] Using EVM stake proof wallet=%s chain=%d\n", stakeProof.WalletAddress, stakeProof.EvmChainID)
+	} else {
+		stakeProof, err = loadStakeProofFromFile(stakeProofPath, privKey, stakeChain)
+		if err != nil {
+			log.Fatalf("Failed to load stake proof: %v", err)
+		}
+		if stakeProof == nil {
+			stakeProof, err = runStakingHelper(ctx, stakeProofPath, stakeAmount, stakeChain, stakeAddress, stakeWebPort, privKey)
+			if err != nil {
+				log.Fatalf("Staking helper failed: %v", err)
+			}
+			fmt.Printf("[Prov] Stake proof saved to %s\n", stakeProofPath)
+		}
+		fmt.Printf("[Prov] Using mock stake proof tx=%s amount=%.2f chain=%s\n", stakeProof.TxHash, stakeProof.Amount, stakeProof.ChainID)
 	}
-	fmt.Printf("[Prov] Using stake proof tx=%s amount=%.2f chain=%s\n", stakeProof.TxHash, stakeProof.Amount, stakeProof.ChainID)
 
 	log.Printf("PROVIDER ONLINE: %s (ID: %s)\n", daemon.Card.Name, h.ID().ShortString())
 
@@ -560,7 +940,11 @@ func main() {
 	stakeProofPath := flag.String("stake-proof", "stake_proof.json", "path to stake proof file (provider only)")
 	stakeWebPort := flag.Int("stake-web-port", 8090, "port for local staking helper UI (provider only)")
 	stakeAddress := flag.String("stake-address", "0xDEADBEEF00000000000000000000000000DEMO", "display address for staking UI (provider only)")
+	stakeMode := flag.String("stake-mode", "mock", "staking mode: mock or evm (provider only)")
+	evmChainID := flag.Int64("evm-chain-id", 1, "EVM chain ID (default: 1 Mainnet, use 11155111 for Sepolia)")
+	stakingContract := flag.String("staking-contract", "", "PRXSStaking contract address (EVM mode)")
 	mcpConfig := flag.String("mcp-config", "mcp_config.yaml", "path to MCP config file (mcp-server only)")
+	registryAPI := flag.String("registry-api", "", "Registry REST API URL for credits (e.g., http://localhost:8080)")
 	flag.Parse()
 
 	// Load Key if specified, otherwise generate ephemeral
@@ -582,7 +966,7 @@ func main() {
 		if *bootstrap == "" {
 			log.Fatal("Need -bootstrap")
 		}
-		startProvider(*port, *agent, *bootstrap, *devMode, *stakeAmount, *stakeChain, *stakeProofPath, *stakeWebPort, *stakeAddress, privKey)
+		startProvider(*port, *agent, *bootstrap, *devMode, *stakeAmount, *stakeChain, *stakeProofPath, *stakeWebPort, *stakeAddress, privKey, *stakeMode, *evmChainID, *stakingContract, *registryAPI)
 	case "client":
 		if *bootstrap == "" {
 			log.Fatal("Need -bootstrap")

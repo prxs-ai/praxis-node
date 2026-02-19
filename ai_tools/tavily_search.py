@@ -65,7 +65,7 @@ def build_params(raw: Any) -> Dict[str, Any]:
 
 
 def call_tavily(query: str) -> Dict[str, Any]:
-    api_key = "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"
+    api_key = os.environ.get("TAVILY_API_KEY", "")
     if not api_key:
         raise RuntimeError("TAVILY_API_KEY is not set")
 

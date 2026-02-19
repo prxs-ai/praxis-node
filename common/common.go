@@ -38,6 +38,29 @@ func CommonLibp2pOptions(port int, key crypto.PrivKey) []libp2p.Option {
 	return options
 }
 
+// CommonLibp2pOptionsWithAnnounce is like CommonLibp2pOptions but additionally
+// announces a static public IP (useful in Docker/NAT environments).
+func CommonLibp2pOptionsWithAnnounce(port int, key crypto.PrivKey, announceIP string) []libp2p.Option {
+	options := CommonLibp2pOptions(port, key)
+
+	var announceAddrs []ma.Multiaddr
+	if tcpAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", announceIP, port)); err == nil {
+		announceAddrs = append(announceAddrs, tcpAddr)
+	}
+	if quicAddr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", announceIP, port)); err == nil {
+		announceAddrs = append(announceAddrs, quicAddr)
+	}
+
+	if len(announceAddrs) > 0 {
+		captured := announceAddrs
+		options = append(options, libp2p.AddrsFactory(func(addrs []ma.Multiaddr) []ma.Multiaddr {
+			return append(addrs, captured...)
+		}))
+	}
+
+	return options
+}
+
 func SetupDHT(ctx context.Context, h host.Host, bootstrapPeers []string, devMode bool) (*dht.IpfsDHT, error) {
 	var opts []dht.Option
 	opts = append(opts, dht.Mode(dht.ModeServer))
