@@ -20,6 +20,7 @@ type RegistrationRecord struct {
 	LastSeen    time.Time
 	ServiceCard common.ServiceCard
 	StakeProof  *common.StakeProof
+	AgentID     string `json:"agent_id,omitempty"`
 	AddrInfo    peer.AddrInfo
 }
 

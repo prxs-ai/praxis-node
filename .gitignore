@@ -1,12 +1,9 @@
 bin
 *.key
-*.exe
 
 # Dependency directories
 node_modules/
 jspm_packages/
-
-.idea
 
 # Logs
 logs
@@ -79,6 +76,9 @@ web_modules/
 .env
 .env.*
 !.env.example
+!.env.mainnet.example
+!.env.production
+!.env.systemd
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -101,3 +101,21 @@ __pycache__/
 # Temporary files
 frontend_example/
 stake_proof*.json
+evm_stake_proof_*.json
+tmpclaude-*-cwd
+
+# IDE
+.idea/
+.vscode/
+
+# Deployment artifacts
+docker/registry/backups/
+docker/registry/logs/
+*.tar.gz
+*.tar.gz.sha256
+
+# Foundry/Forge artifacts
+contracts/lib/
+contracts/out/
+contracts/cache/
+contracts/broadcast/

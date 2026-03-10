@@ -629,7 +629,24 @@ func (pd *ProviderDaemon) chargeClient(clientPeerID string, amount float64, serv
 
 // --- Provider Logic ---
 
-func startProvider(port int, agentPath string, bootstrapAddr string, devMode bool, stakeAmount float64, stakeChain string, stakeProofPath string, stakeWebPort int, stakeAddress string, privKey crypto.PrivKey, stakeMode string, evmChainID int64, stakingContract string, registryAPI string) {
+func startProvider(
+	port int,
+	agentPath string,
+	bootstrapAddr string,
+	devMode bool,
+	stakeAmount float64,
+	stakeChain string,
+	stakeProofPath string,
+	stakeWebPort int,
+	stakeAddress string,
+	privKey crypto.PrivKey,
+	stakeMode string,
+	evmChainID int64,
+	stakingContract string,
+	registryAPI string,
+	agentID string,
+	serviceCardURI string,
+) {
 	ctx := context.Background()
 
 	h, err := libp2p.New(common.CommonLibp2pOptions(port, privKey)...)
@@ -727,10 +744,12 @@ func startProvider(port int, agentPath string, bootstrapAddr string, devMode boo
 				}
 
 				req := common.RegistryRequest{
-					Method:       "register",
-					Card:         daemon.Card,
-					ProviderInfo: &myself,
-					StakeProof:   stakeProof,
+					Method:         "register",
+					Card:           daemon.Card,
+					ProviderInfo:   &myself,
+					StakeProof:     stakeProof,
+					AgentID:        agentID,
+					ServiceCardURI: serviceCardURI,
 				}
 
 				rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
@@ -943,6 +962,8 @@ func main() {
 	stakeMode := flag.String("stake-mode", "mock", "staking mode: mock or evm (provider only)")
 	evmChainID := flag.Int64("evm-chain-id", 1, "EVM chain ID (default: 1 Mainnet, use 11155111 for Sepolia)")
 	stakingContract := flag.String("staking-contract", "", "PRXSStaking contract address (EVM mode)")
+	agentID := flag.String("agent-id", "", "ERC-8004 agentId (ERC-721 tokenId) for provider identity (provider only)")
+	serviceCardURI := flag.String("service-card-uri", "", "URI to off-chain service card JSON (provider only)")
 	mcpConfig := flag.String("mcp-config", "mcp_config.yaml", "path to MCP config file (mcp-server only)")
 	registryAPI := flag.String("registry-api", "", "Registry REST API URL for credits (e.g., http://localhost:8080)")
 	flag.Parse()
@@ -966,7 +987,7 @@ func main() {
 		if *bootstrap == "" {
 			log.Fatal("Need -bootstrap")
 		}
-		startProvider(*port, *agent, *bootstrap, *devMode, *stakeAmount, *stakeChain, *stakeProofPath, *stakeWebPort, *stakeAddress, privKey, *stakeMode, *evmChainID, *stakingContract, *registryAPI)
+		startProvider(*port, *agent, *bootstrap, *devMode, *stakeAmount, *stakeChain, *stakeProofPath, *stakeWebPort, *stakeAddress, privKey, *stakeMode, *evmChainID, *stakingContract, *registryAPI, *agentID, *serviceCardURI)
 	case "client":
 		if *bootstrap == "" {
 			log.Fatal("Need -bootstrap")

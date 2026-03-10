@@ -31,10 +31,12 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 
 	"prxs/common"
+	"prxs/erc8004"
 	"prxs/staking"
 	"prxs/storage"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
+	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
 // RegistrationRecord tracks an active provider session.
@@ -42,6 +44,7 @@ type RegistrationRecord struct {
 	LastSeen    time.Time
 	ServiceCard common.ServiceCard
 	StakeProof  *common.StakeProof
+	AgentID     string
 	AddrInfo    peer.AddrInfo
 }
 
@@ -54,6 +57,15 @@ type freezedStake struct {
 
 // UNFREEZE_DELAY is the duration (in seconds) a stake must remain frozen before unfreezing.
 const UNFREEZE_DELAY = 7 * 86400 // 7 days
+
+// ReputationMetrics tracks provider performance for ERC-8004 reputation submission.
+type ReputationMetrics struct {
+	AgentId         *big.Int
+	PeerID          peer.ID
+	FirstSeen       time.Time
+	LastHeartbeat   time.Time
+	TotalHeartbeats int64
+}
 
 type evmStakingVerifier interface {
 	GetChainID() *big.Int
@@ -90,16 +102,23 @@ type RegistryNode struct {
 	evmContractAddress ethcommon.Address
 
 	// Settlement
-	ethClient             *EthereumClient
-	settlementEnabled     bool
-	settlementRate        float64
-	settlementMinAmount   float64
-	settlementConfirms    int
-	settlementChain       string
+	ethClient           *EthereumClient
+	settlementEnabled   bool
+	settlementRate      float64
+	settlementMinAmount float64
+	settlementConfirms  int
+	settlementChain     string
 
 	// Deposit
 	depositEnabled  bool
 	depositContract string
+
+	// ERC-8004 integration
+	erc8004Client     *erc8004.Client
+	erc8004Enabled    bool
+	reputationMetrics map[peer.ID]*ReputationMetrics // metrics for reputation submission
+	peerToAgentId     map[peer.ID]*big.Int           // mapping from peerID to on-chain agentId
+	reputationMu      sync.Mutex
 }
 
 func main() {
@@ -140,6 +159,13 @@ func main() {
 	depositEnabled := flag.Bool("deposit-enabled", false, "enable blockchain deposits (ETH -> credits)")
 	depositContract := flag.String("deposit-contract", "", "PRXSDeposit contract address")
 
+	// ERC-8004 flags
+	erc8004Enabled := flag.Bool("erc8004-enabled", false, "Enable ERC-8004 identity verification + on-chain reputation")
+	erc8004IdentityRegistry := flag.String("erc8004-identity", "", "ERC-8004 Identity Registry contract address")
+	erc8004ReputationRegistry := flag.String("erc8004-reputation", "", "ERC-8004 Reputation Registry contract address")
+	erc8004ValidationRegistry := flag.String("erc8004-validation", "", "ERC-8004 Validation Registry contract address")
+	erc8004PrivateKey := flag.String("erc8004-private-key", "", "Private key for ERC-8004 reputation transactions (hex, without 0x)")
+
 	flag.Parse()
 
 	// Load Key if specified, otherwise generate ephemeral
@@ -171,10 +197,10 @@ func main() {
 		baseURL = "https://openrouter.ai/api/v1"
 	}
 
-	startRegistry(*port, *apiPort, *bootstrap, *devMode, *minStake, privKey, *announceIP, *qdrantURL, *qdrantCollection, *qdrantEnabled, *redisAddr, *embeddingDim, *embeddingModel, baseURL, key, *stakingMode, *evmRPCURL, *evmChainID, *stakingContract, *stakeCacheTTL, *settlementEnabled, *settlementRPCURL, *settlementPrivateKey, *settlementRate, *settlementMinAmount, *settlementConfirms, *settlementChain, *depositEnabled, *depositContract)
+	startRegistry(*port, *apiPort, *bootstrap, *devMode, *minStake, privKey, *announceIP, *qdrantURL, *qdrantCollection, *qdrantEnabled, *redisAddr, *embeddingDim, *embeddingModel, baseURL, key, *stakingMode, *evmRPCURL, *evmChainID, *stakingContract, *stakeCacheTTL, *settlementEnabled, *settlementRPCURL, *settlementPrivateKey, *settlementRate, *settlementMinAmount, *settlementConfirms, *settlementChain, *depositEnabled, *depositContract, *erc8004Enabled, *erc8004IdentityRegistry, *erc8004ReputationRegistry, *erc8004ValidationRegistry, *erc8004PrivateKey)
 }
 
-func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, minStake float64, privKey crypto.PrivKey, announceIP string, qdrantURL, qdrantCollection string, qdrantEnabled bool, redisAddr string, embeddingDim int, embeddingModel, embeddingBaseURL, embeddingAPIKey string, stakingMode string, evmRPCURL string, evmChainID int64, stakingContract string, stakeCacheTTL time.Duration, settlementEnabled bool, settlementRPCURL string, settlementPrivateKey string, settlementRate float64, settlementMinAmount float64, settlementConfirms int, settlementChain string, depositEnabled bool, depositContract string) {
+func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, minStake float64, privKey crypto.PrivKey, announceIP string, qdrantURL, qdrantCollection string, qdrantEnabled bool, redisAddr string, embeddingDim int, embeddingModel, embeddingBaseURL, embeddingAPIKey string, stakingMode string, evmRPCURL string, evmChainID int64, stakingContract string, stakeCacheTTL time.Duration, settlementEnabled bool, settlementRPCURL string, settlementPrivateKey string, settlementRate float64, settlementMinAmount float64, settlementConfirms int, settlementChain string, depositEnabled bool, depositContract string, erc8004Enabled bool, erc8004Identity string, erc8004Reputation string, erc8004Validation string, erc8004PrivKey string) {
 
 	ctx := context.Background()
 
@@ -257,6 +283,54 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 		}
 	}
 
+	// Initialize ERC-8004 client if enabled.
+	var erc8004Client *erc8004.Client
+	if erc8004Enabled {
+		if evmRPCURL == "" {
+			log.Fatalf("[Reg] ERC-8004 enabled but no EVM RPC URL provided")
+		}
+		if erc8004Identity == "" || erc8004Reputation == "" || erc8004Validation == "" {
+			log.Fatalf("[Reg] ERC-8004 enabled but registry addresses not provided")
+		}
+		if erc8004PrivKey == "" {
+			log.Fatalf("[Reg] ERC-8004 enabled but private key not provided")
+		}
+
+		privKeyBytes, err := hexToBytes(erc8004PrivKey)
+		if err != nil {
+			log.Fatalf("[Reg] Failed to parse ERC-8004 private key: %v", err)
+		}
+		privKeyECDSA, err := ethcrypto.ToECDSA(privKeyBytes)
+		if err != nil {
+			log.Fatalf("[Reg] Failed to load ERC-8004 private key: %v", err)
+		}
+
+		erc8004Client, err = erc8004.NewClient(erc8004.Config{
+			RPCEndpoint:            evmRPCURL,
+			IdentityRegistryAddr:   ethcommon.HexToAddress(erc8004Identity),
+			ReputationRegistryAddr: ethcommon.HexToAddress(erc8004Reputation),
+			ValidationRegistryAddr: ethcommon.HexToAddress(erc8004Validation),
+			PrivateKey:             privKeyECDSA,
+			ChainID:                big.NewInt(evmChainID),
+		})
+		if err != nil {
+			log.Fatalf("[Reg] Failed to initialize ERC-8004 client: %v", err)
+		}
+		log.Printf("[Reg] ERC-8004 enabled: identity=%s reputation=%s validation=%s", erc8004Identity, erc8004Reputation, erc8004Validation)
+
+		// Ensure the registry wallet is a trusted aggregator on the ReputationRegistry.
+		// This must succeed before we can submit reputation batches.
+		ensureCtx, ensureCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		if err := erc8004Client.EnsureTrustedAggregator(ensureCtx); err != nil {
+			ensureCancel()
+			log.Fatalf("[Reg] ERC-8004: failed to ensure trusted aggregator status: %v\n"+
+				"[Reg] Ensure the registry wallet is the PRXSReputationRegistry owner,\n"+
+				"[Reg] or manually call setTrustedAggregator(<registry-wallet>, true) on the contract.", err)
+		}
+		ensureCancel()
+		log.Printf("[Reg] ERC-8004: registry wallet confirmed as trusted aggregator")
+	}
+
 	reg := &RegistryNode{
 		Host:               h,
 		Registrations:      make(map[peer.ID]*RegistrationRecord),
@@ -282,6 +356,11 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 		// Deposit
 		depositEnabled:  depositEnabled,
 		depositContract: depositContract,
+		// ERC-8004 integration
+		erc8004Client:     erc8004Client,
+		erc8004Enabled:    erc8004Enabled,
+		reputationMetrics: make(map[peer.ID]*ReputationMetrics),
+		peerToAgentId:     make(map[peer.ID]*big.Int),
 	}
 
 	// Restore state from Redis if enabled
@@ -343,6 +422,11 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 		go reg.depositWatcher()
 	}
 
+	// Reputation Batch Submitter (if enabled)
+	if reg.erc8004Enabled && reg.erc8004Client != nil {
+		go reg.reputationBatchSubmitter()
+	}
+
 	// Start REST API server
 	go func() {
 		router := reg.setupRESTAPI()
@@ -360,6 +444,8 @@ func startRegistry(port int, apiPort int, bootstrapAddr string, devMode bool, mi
 func (r *RegistryNode) gcLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	for range ticker.C {
+		var pruned []peer.ID
+
 		r.mu.Lock()
 		now := time.Now()
 		for pid, record := range r.Registrations {
@@ -367,6 +453,7 @@ func (r *RegistryNode) gcLoop() {
 				log.Printf("[Reg] 💀 Pruning dead provider: %s (last seen %s)\n", pid.ShortString(), record.LastSeen.Format(time.RFC3339))
 				delete(r.Registrations, pid)
 				r.removeFromIndex(pid, record.ServiceCard.Name)
+				pruned = append(pruned, pid)
 
 				// Also delete from Redis if enabled
 				if err := r.storage.DeleteRegistration(context.Background(), pid, record.ServiceCard.Name); err != nil {
@@ -375,6 +462,16 @@ func (r *RegistryNode) gcLoop() {
 			}
 		}
 		r.mu.Unlock()
+
+		// Clean up reputation metrics for pruned providers (lock order: mu first, then reputationMu).
+		if r.erc8004Enabled && len(pruned) > 0 {
+			r.reputationMu.Lock()
+			for _, pid := range pruned {
+				delete(r.reputationMetrics, pid)
+				delete(r.peerToAgentId, pid)
+			}
+			r.reputationMu.Unlock()
+		}
 	}
 }
 
@@ -448,6 +545,108 @@ func (r *RegistryNode) stakeUnfreezer() {
 	}
 }
 
+// reputationBatchSubmitter periodically submits reputation metrics to ERC-8004.
+func (r *RegistryNode) reputationBatchSubmitter() {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+
+	// Give providers some time to register and send heartbeats before first submission.
+	time.Sleep(5 * time.Minute)
+	for range ticker.C {
+		r.submitReputationBatch()
+	}
+}
+
+// submitReputationBatch collects metrics and submits to ERC-8004 Reputation Registry.
+// Only active providers are included; stale entries are removed from the metrics map.
+// Metrics are reset after each submission so each batch reflects the last 24-hour window.
+func (r *RegistryNode) submitReputationBatch() {
+	// Snapshot active providers first (without holding reputationMu) to avoid lock inversion.
+	r.mu.Lock()
+	activeProviders := make(map[peer.ID]bool, len(r.Registrations))
+	for pid := range r.Registrations {
+		activeProviders[pid] = true
+	}
+	r.mu.Unlock()
+
+	r.reputationMu.Lock()
+	defer r.reputationMu.Unlock()
+
+	if len(r.reputationMetrics) == 0 {
+		log.Println("[Reg] 📊 No reputation metrics to submit")
+		return
+	}
+
+	batch := make([]erc8004.BatchFeedback, 0, len(r.reputationMetrics))
+	now := time.Now()
+
+	for peerID, metrics := range r.reputationMetrics {
+		// Drop metrics for providers that are no longer registered.
+		if !activeProviders[peerID] {
+			delete(r.reputationMetrics, peerID)
+			delete(r.peerToAgentId, peerID)
+			continue
+		}
+
+		if metrics.AgentId == nil {
+			log.Printf("[Reg] ⚠️  Skipping reputation for peer %s: no agentId", peerID.ShortString())
+			continue
+		}
+
+		uptimeScore := int64(0)
+		timeSinceLastHeartbeat := now.Sub(metrics.LastHeartbeat)
+		if timeSinceLastHeartbeat < 5*time.Minute {
+			uptimeScore = 95
+		} else if timeSinceLastHeartbeat < 1*time.Hour {
+			uptimeScore = 80
+		} else if timeSinceLastHeartbeat < 24*time.Hour {
+			uptimeScore = 60
+		} else {
+			uptimeScore = 30
+		}
+
+		timeActive := now.Sub(metrics.FirstSeen)
+		expectedHeartbeats := int64(timeActive.Minutes() / 0.5) // expected every 30 sec
+		if expectedHeartbeats > 0 {
+			reliabilityPercent := (metrics.TotalHeartbeats * 100) / expectedHeartbeats
+			if reliabilityPercent > 100 {
+				reliabilityPercent = 100
+			}
+			uptimeScore = (uptimeScore + reliabilityPercent) / 2
+		}
+
+		batch = append(batch, erc8004.BatchFeedback{
+			AgentId:       metrics.AgentId,
+			Value:         uptimeScore,
+			ValueDecimals: 0,
+			Tag1:          "uptime",
+			Tag2:          "prxs_registry",
+		})
+
+		// Reset sliding-window counters so the next batch covers the next 24h period.
+		metrics.TotalHeartbeats = 0
+		metrics.FirstSeen = now
+	}
+
+	if len(batch) == 0 {
+		log.Println("[Reg] 📊 No valid reputation entries to submit")
+		return
+	}
+
+	go func(feedbackBatch []erc8004.BatchFeedback) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		tx, err := r.erc8004Client.GiveBatchFeedback(ctx, feedbackBatch)
+		if err != nil {
+			log.Printf("[Reg] ⚠️  Failed to submit reputation batch: %v", err)
+			return
+		}
+
+		log.Printf("[Reg] 📊 Submitted reputation batch for %d providers (tx=%s)", len(feedbackBatch), tx.Hash().Hex())
+	}(batch)
+}
+
 // --- Index helpers ---
 
 func (r *RegistryNode) addToIndex(pid peer.ID, serviceName string) {
@@ -482,6 +681,7 @@ func (r *RegistryNode) convertToStorageRecord(record *RegistrationRecord) *stora
 		LastSeen:    record.LastSeen,
 		ServiceCard: record.ServiceCard,
 		StakeProof:  record.StakeProof,
+		AgentID:     record.AgentID,
 		AddrInfo:    record.AddrInfo,
 	}
 }
@@ -495,6 +695,7 @@ func (r *RegistryNode) convertFromStorageRecord(record *storage.RegistrationReco
 		LastSeen:    record.LastSeen,
 		ServiceCard: record.ServiceCard,
 		StakeProof:  record.StakeProof,
+		AgentID:     record.AgentID,
 		AddrInfo:    record.AddrInfo,
 	}
 }
@@ -560,13 +761,44 @@ func (r *RegistryNode) restoreStateFromRedis(ctx context.Context) error {
 	}
 
 	// Convert storage records to main records and rebuild the index
+	restoredAgentIDs := make([]struct {
+		pid     peer.ID
+		agentId *big.Int
+	}, 0, len(storageRecords))
+
 	r.mu.Lock()
 	for pid, storageRecord := range storageRecords {
 		record := r.convertFromStorageRecord(storageRecord)
 		r.Registrations[pid] = record
 		r.addToIndex(pid, record.ServiceCard.Name)
+
+		if r.erc8004Enabled && record.AgentID != "" {
+			if agentId, ok := new(big.Int).SetString(record.AgentID, 10); ok && agentId.Sign() > 0 {
+				restoredAgentIDs = append(restoredAgentIDs, struct {
+					pid     peer.ID
+					agentId *big.Int
+				}{pid: pid, agentId: agentId})
+			}
+		}
 	}
 	r.mu.Unlock()
+
+	if len(restoredAgentIDs) > 0 {
+		r.reputationMu.Lock()
+		for _, item := range restoredAgentIDs {
+			r.peerToAgentId[item.pid] = item.agentId
+			if _, exists := r.reputationMetrics[item.pid]; !exists {
+				r.reputationMetrics[item.pid] = &ReputationMetrics{
+					AgentId:         item.agentId,
+					PeerID:          item.pid,
+					FirstSeen:       time.Now(),
+					LastHeartbeat:   time.Now(),
+					TotalHeartbeats: 0,
+				}
+			}
+		}
+		r.reputationMu.Unlock()
+	}
 
 	if len(storageRecords) > 0 {
 		log.Printf("[Reg] ✅ Restored %d active registrations", len(storageRecords))
@@ -797,9 +1029,18 @@ func (r *RegistryNode) checkEVMStakeValidity(remote peer.ID, proof *common.Stake
 	return nil
 }
 
-func (r *RegistryNode) isHeartbeat(existing *RegistrationRecord, isRegistered bool, proof *common.StakeProof) bool {
+func (r *RegistryNode) isHeartbeat(existing *RegistrationRecord, isRegistered bool, proof *common.StakeProof, incomingAgentID string) bool {
 	if !isRegistered || existing == nil || existing.StakeProof == nil || proof == nil {
 		return false
+	}
+
+	if r.erc8004Enabled {
+		if existing.AgentID == "" || incomingAgentID == "" {
+			return false
+		}
+		if existing.AgentID != incomingAgentID {
+			return false
+		}
 	}
 
 	existingIsEVM := existing.StakeProof.IsEVMMode()
@@ -839,6 +1080,13 @@ func (r *RegistryNode) applyHeartbeat(remote peer.ID, providerInfo *peer.AddrInf
 	if err := r.storage.SaveRegistration(context.Background(), remote, storageRecord); err != nil {
 		log.Printf("[Reg] Warning: Failed to save heartbeat to Redis: %v", err)
 	}
+
+	r.reputationMu.Lock()
+	if metrics, exists := r.reputationMetrics[remote]; exists {
+		metrics.LastHeartbeat = time.Now()
+		metrics.TotalHeartbeats++
+	}
+	r.reputationMu.Unlock()
 
 	return true
 }
@@ -901,7 +1149,7 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 		existing, isRegistered := r.Registrations[remotePeer]
 		r.mu.Unlock()
 
-		isHeartbeat := r.isHeartbeat(existing, isRegistered, req.StakeProof)
+		isHeartbeat := r.isHeartbeat(existing, isRegistered, req.StakeProof, req.AgentID)
 
 		if isHeartbeat {
 			if r.applyHeartbeat(remotePeer, req.ProviderInfo) {
@@ -930,6 +1178,56 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 				}
 			}
 
+			var agentId *big.Int
+			if r.erc8004Enabled && r.erc8004Client != nil {
+				if req.AgentID == "" {
+					resp.Error = "agent_id required when erc8004 is enabled"
+					log.Printf("[Reg] ❌ ERC-8004: %s\n", resp.Error)
+					break
+				}
+				if req.StakeProof == nil || !req.StakeProof.IsEVMMode() || req.StakeProof.WalletAddress == "" {
+					resp.Error = "EVM stake proof with wallet_address required when erc8004 is enabled"
+					log.Printf("[Reg] ❌ ERC-8004: %s\n", resp.Error)
+					break
+				}
+
+				parsedAgentId, ok := new(big.Int).SetString(req.AgentID, 10)
+				if !ok || parsedAgentId.Sign() <= 0 {
+					resp.Error = "invalid agent_id"
+					log.Printf("[Reg] ❌ ERC-8004: %s\n", resp.Error)
+					break
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				owner, err := r.erc8004Client.OwnerOf(ctx, parsedAgentId)
+				cancel()
+				if err != nil {
+					resp.Error = fmt.Sprintf("erc8004 owner check failed: %v", err)
+					log.Printf("[Reg] ❌ ERC-8004: %s\n", resp.Error)
+					break
+				}
+
+				wallet := ethcommon.HexToAddress(req.StakeProof.WalletAddress)
+				if owner != wallet {
+					resp.Error = fmt.Sprintf("erc8004 owner mismatch: agent owner %s != stake wallet %s", owner.Hex(), wallet.Hex())
+					log.Printf("[Reg] ❌ ERC-8004: %s\n", resp.Error)
+					break
+				}
+
+				// Verify on-chain peerID->agentId binding. The provider must have called
+				// registerProvider(peerID, agentURI, paymentWallet) on PRXSIdentityRegistry.
+				bindCtx, bindCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				bindErr := r.erc8004Client.VerifyPeerIDBinding(bindCtx, remotePeer.String(), parsedAgentId)
+				bindCancel()
+				if bindErr != nil {
+					resp.Error = fmt.Sprintf("erc8004 peerID binding check failed: %v", bindErr)
+					log.Printf("[Reg] ❌ ERC-8004: %s\n", resp.Error)
+					break
+				}
+
+				agentId = parsedAgentId
+			}
+
 			_ = replayKey
 
 			var embedding []float32
@@ -954,6 +1252,7 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 					LastSeen:    time.Now(),
 					ServiceCard: req.Card,
 					StakeProof:  req.StakeProof,
+					AgentID:     req.AgentID,
 					AddrInfo:    *req.ProviderInfo,
 				}
 				r.Registrations[remotePeer] = newRecord
@@ -970,6 +1269,24 @@ func (r *RegistryNode) handleStream(stream network.Stream) {
 			resp.Success = true
 
 			r.mu.Unlock()
+
+			// Save agentId mapping and initialize reputation metrics (provider-minted flow).
+			if r.erc8004Enabled && r.erc8004Client != nil && agentId != nil {
+				r.reputationMu.Lock()
+				r.peerToAgentId[remotePeer] = agentId
+				if metrics, exists := r.reputationMetrics[remotePeer]; exists {
+					metrics.AgentId = agentId
+				} else {
+					r.reputationMetrics[remotePeer] = &ReputationMetrics{
+						AgentId:         agentId,
+						PeerID:          remotePeer,
+						FirstSeen:       time.Now(),
+						LastHeartbeat:   time.Now(),
+						TotalHeartbeats: 1,
+					}
+				}
+				r.reputationMu.Unlock()
+			}
 
 			// Optional: index in Qdrant for semantic search
 			if r.qdrant != nil && len(embedding) > 0 {
@@ -1061,6 +1378,14 @@ func (r *RegistryNode) handleUnregister(remotePeer peer.ID, req *common.Registry
 			log.Printf("[Reg] 🗑️ Removed EVM service %s for peer %s\n", serviceName, remotePeer.ShortString())
 		}
 		r.mu.Unlock()
+
+		// Clean up reputation metrics for the unregistered provider.
+		if r.erc8004Enabled {
+			r.reputationMu.Lock()
+			delete(r.reputationMetrics, remotePeer)
+			delete(r.peerToAgentId, remotePeer)
+			r.reputationMu.Unlock()
+		}
 
 		resp.Success = true
 		log.Printf("[Reg] ✅ EVM unregister complete for %s (stake managed on-chain)\n", remotePeer.ShortString())
@@ -1166,6 +1491,14 @@ func (r *RegistryNode) handleUnregister(remotePeer peer.ID, req *common.Registry
 	}
 	r.mu.Unlock()
 
+	// Clean up reputation metrics for the unregistered provider.
+	if r.erc8004Enabled {
+		r.reputationMu.Lock()
+		delete(r.reputationMetrics, remotePeer)
+		delete(r.peerToAgentId, remotePeer)
+		r.reputationMu.Unlock()
+	}
+
 	resp.Success = true
 	log.Printf("[Reg] 🧊 Unregistered stake %s for %s: frozen until %s\n",
 		stakeKey, remotePeer.ShortString(), time.Unix(now+UNFREEZE_DELAY, 0).Format(time.RFC3339))
@@ -1206,6 +1539,9 @@ func (r *RegistryNode) setupRESTAPI() *gin.Engine {
 
 		// GET registry info (Peer ID and multiaddr)
 		api.GET("/registry/info", r.getRegistryInfo)
+
+		// ERC-8004 reputation API
+		api.GET("/reputation/:agentId", r.getReputation)
 
 		// Credits API (Agent-to-Agent payments)
 		api.GET("/credits/:peerId", r.getBalance)
@@ -1461,6 +1797,52 @@ func (r *RegistryNode) getRegistryInfo(c *gin.Context) {
 	})
 }
 
+// getReputation returns on-chain reputation summary for an agent.
+func (r *RegistryNode) getReputation(c *gin.Context) {
+	if !r.erc8004Enabled || r.erc8004Client == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ERC-8004 reputation system not enabled"})
+		return
+	}
+
+	agentIDStr := c.Param("agentId")
+	agentID := new(big.Int)
+	agentID, ok := agentID.SetString(agentIDStr, 10)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid agentId format"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	summary, err := r.erc8004Client.GetReputation(ctx, agentID, "uptime", "prxs_registry")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to get reputation: %v", err)})
+		return
+	}
+
+	score := summary.Value.Int64()
+	rating := "poor"
+	if score >= 90 {
+		rating = "excellent"
+	} else if score >= 75 {
+		rating = "good"
+	} else if score >= 50 {
+		rating = "average"
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"agentId":       agentIDStr,
+		"feedbackCount": summary.Count.Int64(),
+		"uptimeScore":   score,
+		"maxScore":      100,
+		"rating":        rating,
+		"decimals":      summary.Decimals,
+		"tag":           "uptime",
+		"source":        "prxs_registry",
+	})
+}
+
 // --- Credits API (Agent-to-Agent payments) ---
 
 // getBalance returns the credit balance for a peer
@@ -1678,7 +2060,7 @@ func (r *RegistryNode) requestWithdrawal(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[Settlement] Created withdrawal request %s: %.2f credits -> %.8f ETH (peer: %s, wallet: %s)",
+	log.Printf("[Settlement] Created withdrawal request %s: %.2f credits -> %.6f ETH (peer: %s, wallet: %s)",
 		wdr.ID, wdr.Amount, ethAmount, req.PeerID[:12], req.WalletAddress)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -2327,4 +2709,12 @@ func (qc *QdrantClient) Search(vector []float32, limit int) ([]qdrantSearchResul
 		return nil, err
 	}
 	return sr.Result, nil
+}
+
+// hexToBytes converts hex string to bytes (with or without 0x prefix).
+func hexToBytes(s string) ([]byte, error) {
+	if len(s) >= 2 && s[0:2] == "0x" {
+		s = s[2:]
+	}
+	return ethcommon.FromHex(s), nil
 }

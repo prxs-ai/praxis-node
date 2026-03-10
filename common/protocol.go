@@ -194,6 +194,10 @@ type RegistryRequest struct {
 	Card       ServiceCard `json:"card,omitempty"`
 	Query      string      `json:"query,omitempty"`
 	StakeProof *StakeProof `json:"stake_proof,omitempty"`
+	// ERC-8004 identity (agentId == ERC-721 tokenId). When enabled, registry verifies that
+	// the EVM wallet bound in StakeProof matches ownerOf(agentId).
+	AgentID        string `json:"agent_id,omitempty"`
+	ServiceCardURI string `json:"service_card_uri,omitempty"`
 	// Providers send their own address info so the Registry can tell Clients how to connect
 	ProviderInfo *peer.AddrInfo `json:"provider_info,omitempty"`
 }
